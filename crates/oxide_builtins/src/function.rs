@@ -193,10 +193,11 @@ pub fn function_call<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 }
 
 /// `Function.prototype.apply(thisArg, argsArray)`：以指定 this 和参数对象调用
-/// 目标函数。argsArray 为 null/undefined → 无实参；对象（数组 / Arguments /
-/// 数组类对象）读 `length`（传播读，强转为长度）后逐下标传播读元素（空位取
-/// undefined）；元素物化为实参切片经 TailCall 下发（帧参数区），不受寄存器
-/// 窗口限制。length/元素 getter 抛错时透传原异常值。
+/// 目标函数。目标非可调用 → TypeError（先查，先于 argArray 检查）；argsArray
+/// 为 null/undefined → 无实参；非对象（非 nullish）→ TypeError；对象（数组 /
+/// Arguments / 数组类对象）读 `length`（传播读，强转为长度）后逐下标传播读
+/// 元素（空位取 undefined）；元素物化为实参切片经 TailCall 下发（帧参数区），
+/// 不受寄存器窗口限制。length/元素 getter 抛错时透传原异常值。
 pub fn function_apply<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if args.is_empty() {
         return NativeResult::Err(JsValue::undefined());
@@ -204,9 +205,25 @@ pub fn function_apply<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let target_val = vm.reg(args[0]);
     let this_val = if args.len() > 1 { vm.reg(args[1]) } else { JsValue::undefined() };
 
+    // IsCallable 检查：目标非可调用先抛 TypeError，先于 argArray 检查。
+    if !target_val.is_object()
+        || target_val.as_js_object_ptr().is_null()
+        || !unsafe { &*target_val.as_js_object_ptr() }.is_function()
+    {
+        return NativeResult::Err(crate::error::create_type_error(vm, "CALL target is not callable"));
+    }
+
     let mut call_args: Vec<JsValue> = Vec::new();
     if args.len() > 2 {
         let arr_val = vm.reg(args[2]);
+        // CreateListFromArrayLike：非对象 argArray（非 nullish）抛 TypeError；
+        // null/undefined 为无实参。
+        if !arr_val.is_object() && !arr_val.is_nullish() {
+            return NativeResult::Err(crate::error::create_type_error(
+                vm,
+                "CreateListFromArrayLike called on non-object",
+            ));
+        }
         if arr_val.is_object() {
             let arr_ptr = arr_val.as_js_object_ptr();
             if !arr_ptr.is_null() {

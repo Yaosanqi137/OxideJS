@@ -258,6 +258,27 @@ fn function_apply_non_callable_this_throws_catchable_type_error() {
 }
 
 #[test]
+fn function_apply_non_object_argarray_throws_type_error() {
+    // CreateListFromArrayLike：非对象 argArray（非 nullish）抛可捕获 TypeError；
+    // 目标非可调用先抛（先于 argArray 检查）；null/undefined argArray 为无实参不抛。
+    let mut vm = Vm::new();
+    for src in [
+        "try { function f(){} f.apply(null, true) } catch (e) { e.name }",
+        "try { function f(){} f.apply(null, NaN) } catch (e) { e.name }",
+        "try { function f(){} f.apply(null, '1,2,3') } catch (e) { e.name }",
+        "try { function f(){} f.apply(null, Symbol()) } catch (e) { e.name }",
+        "try { Function.prototype.apply.call(undefined, {}, true) } catch (e) { e.name }",
+    ] {
+        let name = eval(&mut vm, src).unwrap();
+        assert_eq!(vm.lookup_str(name).unwrap_or_default(), "TypeError", "for {}", src);
+    }
+    let result = eval(&mut vm, "function f(){ return arguments.length; } f.apply(null, null)").unwrap();
+    assert_num(result, 0.0);
+    let result = eval(&mut vm, "function f(){ return arguments.length; } f.apply(null, undefined)").unwrap();
+    assert_num(result, 0.0);
+}
+
+#[test]
 fn function_call_non_callable_target_keeps_type_error_kind() {
     // call 转发到非可调用目标（原始值 thisArg）：内层递归无原值可恢复时，
     // 错误种类仍须保持 TypeError。
