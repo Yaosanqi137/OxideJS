@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use super::*;
 use crate::vm::{CallFrame, FrameContinuation};
-use oxide_builtins::{array_buffer, data_view, disposable_stack, map, set, typed_array};
+use oxide_builtins::{array_buffer, data_view, disposable_stack, map, module, set, typed_array};
+use oxide_emit::module::{ModuleKind, ModuleSourceLoader, ResolvedModule};
 use oxide_runtime_api::NativeResult;
 
 fn plain_object(vm: &mut Vm) -> *mut JsObject {
@@ -456,7 +457,8 @@ fn map_native_storage_is_not_a_normal_object_edge() {
     let mut stack = Vec::new();
     let mut live = HashSet::with_hasher(FxBuildHasher);
     let mut live_bigints = HashSet::with_hasher(FxBuildHasher);
-    SessionGc::scan_edges_for_mark(map_obj, &vm, &mut stack, &mut live, &mut live_bigints);
+    let mut live_cells = HashSet::with_hasher(FxBuildHasher);
+    SessionGc::scan_edges_for_mark(map_obj, &vm, &mut stack, &mut live, &mut live_bigints, &mut live_cells);
     assert!(!stack.iter().any(|&ptr| std::ptr::eq(ptr, native_ptr)));
 }
 
@@ -1214,6 +1216,205 @@ fn cells_freed_by_full_reset_and_reallocatable() {
         )))
         .expect("run2");
     assert_eq!(format!("{result}"), "2", "重置后新 cell 应正常分配与读取");
+}
+
+// ── upvalue cell 参与 mark-sweep：死 cell 释放、活 cell 四根面存活 ─────────
+
+/// 死闭包 cell 字节账目差分：两条同构 arrow 仅 upvalue 数不同（3 vs 0），各走
+/// 独立 VM「创建 → 撤根 → 完整收集」。两次收集字节账目差 = 死 arrow 的 upvalue
+/// 列表 Box + 3 个 cell（对象本体、属性区、函数名串在 A/B 恒等相消）。死分支不
+/// 释放 cell（泄漏）时差分少 3×16B，本断言转红。
+#[test]
+fn dead_closure_cells_freed_by_sweep_byte_diff() {
+    let collect_freed = |src: &str| -> u64 {
+        let mut v = vm_with_threshold(4096);
+        v.run(&Arc::new(compile(src))).expect("run create");
+        v.run(&Arc::new(compile("globalThis.arrow = undefined; 0")))
+            .expect("run unroot");
+        v.collect_session_gc();
+        let stats = v.session_gc_stats();
+        assert!(stats.last_collection_objects_dead >= 1, "arrow 闭包应经 sweep 死分支");
+        stats.last_collection_bytes_freed
+    };
+    let freed_with_captures = collect_freed(
+        "(function(){var a = 1; var b = 2; var c = 3; \
+         globalThis.arrow = () => a + b + c; return 0;})()",
+    );
+    let freed_no_captures = collect_freed("globalThis.arrow = () => 7; 0");
+    let upvalue_box_min = (size_of::<Vec<*mut Cell>>() + 3 * size_of::<*mut Cell>()) as u64;
+    let cells_min = (3 * size_of::<Cell>()) as u64;
+    assert!(
+        freed_with_captures >= freed_no_captures + upvalue_box_min + cells_min,
+        "两次收集字节账目差应为死闭包 upvalue 列表 Box + 3 cell（≥{} B），实际差 {}",
+        upvalue_box_min + cells_min,
+        freed_with_captures - freed_no_captures
+    );
+}
+
+/// 活闭包 cell 跨完整收集存活：global 上的活闭包经对象 upvalues 边可达，其 cell
+/// 入存活集；清寄存器仅留 global 根后完整收集，cell 仍登记在 session 表。
+#[test]
+fn live_closure_cell_survives_full_collect() {
+    let mut vm = vm_with_threshold(1);
+    vm.run(&Arc::new(compile(
+        "function outer() { var counter = 0; function inc() { return ++counter; } globalThis.inc = inc; return 0; } outer(); 0",
+    )))
+    .expect("run1");
+    let inc_val = global_prop_opt(&vm, "inc").expect("inc 应挂在 global 上");
+    let obj = unsafe { &*inc_val.as_js_object_ptr() };
+    let cells = obj.upvalues_slice();
+    assert_eq!(cells.len(), 1, "inc 应捕获 counter 一个 cell");
+    let cell_ptr = cells[0];
+    assert!(vm.gc_state.session_cell_ptrs.borrow().contains(&cell_ptr), "活 cell 应登记在表");
+
+    vm.regs.fill(JsValue::undefined());
+    collect(&mut vm);
+
+    // 只断言表成员——sweep 已释放的指针解引用即 UB。
+    assert!(vm.gc_state.session_cell_ptrs.borrow().contains(&cell_ptr), "活 cell 应跨完整收集存活");
+}
+
+/// 活跃帧 cell_stack 根：内层函数 upvalue cell 在活跃帧 cell_stack 上（低阈值使
+/// 同 run 内触发执行期收集）；函数返回后闭包读值正确（cell 未被误释放）。
+#[test]
+fn active_frame_cell_stack_root_survives_in_run_collect() {
+    let mut vm = vm_with_threshold(1);
+    vm.run(&Arc::new(compile(
+        "function outer() { \
+         var counter = 42; \
+         function inc() { return counter; } \
+         globalThis.inc = inc; \
+         var sink = []; \
+         for (var i = 0; i < 500; i++) { sink.push({ x: i }); } \
+         return 0; \
+       } outer()",
+    )))
+    .expect("run");
+    assert!(vm.session_gc_stats().total_collections >= 1, "执行期收集应触发");
+    let read = vm.run(&Arc::new(compile("globalThis.inc()"))).expect("read");
+    assert_eq!(read, JsValue::int(42), "闭包读值正确（活跃帧 cell_stack 上的 cell 未被误释放）");
+}
+
+/// 挂起状态盒根：生成器局部变量被嵌套闭包捕获的 cell 在挂起帧 cell_stack 上
+/// （快照入状态盒），挂起态完整收集；恢复后读值正确（cell 未被误释放）。
+#[test]
+fn suspended_state_box_cell_root_survives_collect() {
+    let mut vm = vm_with_low_threshold();
+    vm.run(&Arc::new(compile(
+        "(function(){ \
+         function* gen() { \
+           var x = 100; \
+           function f() { return x; } \
+           yield f; \
+           return f(); \
+         } \
+         var g = gen(); g.next(); globalThis.g = g; })(); 0",
+    )))
+    .expect("run");
+
+    let g_val = global_prop_opt(&vm, "g").expect("g 应挂在 global 上");
+    let g_session = vm.promote_object(g_val.as_js_object_ptr());
+    let g_obj = unsafe { &*g_session };
+    // SAFETY: 生成器状态盒经 Box::into_raw 挂对象构造，生命周期与对象一致。
+    let state = g_obj.native_data() as *mut crate::generator::GeneratorState;
+    let cell_ptr = unsafe { &(*state).suspended }
+        .cell_stack
+        .iter()
+        .flatten()
+        .copied()
+        .find(|p| !p.is_null())
+        .expect("挂起帧应持有 x cell");
+    assert!(vm.gc_state.session_cell_ptrs.borrow().contains(&cell_ptr), "cell 应登记在表");
+
+    vm.regs.fill(JsValue::undefined());
+    vm.regs[0] = JsValue::from_js_object(g_session);
+    collect(&mut vm);
+
+    // 只断言表成员——sweep 已释放的指针解引用即 UB。
+    assert!(vm.gc_state.session_cell_ptrs.borrow().contains(&cell_ptr), "挂起帧 cell 应跨完整收集存活");
+
+    // 恢复后读值：cell 未被误释放。
+    let read = vm.run(&Arc::new(compile("globalThis.g.next().value"))).expect("read");
+    assert_eq!(read, JsValue::int(100), "恢复后读值正确（挂起帧 cell 未被误释放）");
+}
+
+/// 文件加载器：base_dir/specifier join 后读源（依赖模块经真实文件解析）。
+struct NsFileLoader;
+impl ModuleSourceLoader for NsFileLoader {
+    fn resolve(
+        &mut self, base_dir: &str, specifier: &str, _attributes: &[(&str, &str)],
+    ) -> Result<ResolvedModule, String> {
+        let joined = std::path::Path::new(base_dir).join(specifier);
+        let full = std::fs::canonicalize(&joined).map_err(|e| format!("cannot read {specifier}: {e}"))?;
+        let source = std::fs::read_to_string(&full).map_err(|e| format!("cannot read {specifier}: {e}"))?;
+        Ok(ResolvedModule {
+            source,
+            path: full.to_string_lossy().into_owned(),
+            kind: ModuleKind::Js,
+        })
+    }
+}
+
+/// 测试结束删除临时目录，避免在 crate 树残留文件。
+struct NsCleanup(std::path::PathBuf);
+impl Drop for NsCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 模块 ns cell 根：依赖模块可重赋导出挂共享 cell（条目表 `Cell` 面），ns 对象
+/// 经 global 可达；清寄存器仅留 ns 根后完整收集，cell 跨移动式 sweep 存活（深拷
+/// 表保留同一 cell 指针），`module_ns_export` 读回正确。
+#[test]
+fn module_ns_cell_root_survives_collect() {
+    let cwd = std::env::current_dir().expect("cwd");
+    let dir = cwd.join("__module_ns_cell_gc__");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("dep.mjs"), "var x = 42; export { x }; globalThis.f = function(){ x = 100; };")
+        .expect("write dep");
+    std::fs::write(dir.join("main.mjs"), "import * as ns from './dep.mjs'; globalThis.__ns = ns;").expect("write main");
+    let _cleanup = NsCleanup(dir.clone());
+
+    let allocator = oxide_parser::Allocator::default();
+    let source = std::fs::read_to_string(dir.join("main.mjs")).expect("read main");
+    let program = oxide_parser::parse_module(&allocator, &source).expect("parse module");
+    let module = Compiler::new()
+        .compile_module(&program, dir.join("main.mjs").to_string_lossy().as_ref(), &mut NsFileLoader)
+        .expect("compile module");
+    let mut vm = vm_with_low_threshold();
+    vm.run(&Arc::new(module)).expect("module run");
+
+    let ns_val = global_prop_opt(&vm, "__ns").expect("__ns 应挂在 global 上");
+    let ns_obj = unsafe { &*ns_val.as_js_object_ptr() };
+    let cell_ptr = module::module_ns_cell_edges(ns_obj)
+        .into_iter()
+        .next()
+        .expect("依赖 ns 应持有 x 的 cell");
+    assert!(vm.gc_state.session_cell_ptrs.borrow().contains(&cell_ptr), "cell 应登记在表");
+
+    vm.regs.fill(JsValue::undefined());
+    vm.regs[0] = ns_val;
+    collect(&mut vm);
+
+    // 只断言表成员——sweep 已释放的指针解引用即 UB。
+    assert!(
+        vm.gc_state.session_cell_ptrs.borrow().contains(&cell_ptr),
+        "模块 ns cell 应跨完整收集存活"
+    );
+
+    // 移动式 sweep 后 ns 晋升 session（原件出表），从 global 重取克隆读回。
+    let ns_val2 = global_prop_opt(&vm, "__ns").expect("__ns 应挂在 global 上");
+    let ns_obj2 = unsafe { &*ns_val2.as_js_object_ptr() };
+    assert!(module::module_ns_cell_edges(ns_obj2).contains(&cell_ptr), "克隆应共享同一 cell 指针");
+    let name_si = vm.kernel_core().perm_interner().intern("x").0;
+    let query = module::module_ns_export(ns_obj2, name_si).expect("x 应可导出");
+    match query {
+        module::ModuleNsQuery::Initialized(v) => {
+            assert_eq!(v, JsValue::int(42), "模块 ns cell 读回正确");
+        }
+        module::ModuleNsQuery::Uninitialized => panic!("x 应已初始化，实得 Uninitialized"),
+    }
 }
 
 #[test]

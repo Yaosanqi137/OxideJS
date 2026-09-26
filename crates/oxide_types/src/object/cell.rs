@@ -1,6 +1,7 @@
 //! 闭包共享 cell：JS 值 + 已初始化 / GC 标记位，定长 16 字节。
 //!
-//! cell 组成闭包的 upvalue 数组（对象 `upvalues` 裸指针区），随闭包释放；
+//! cell 组成闭包的 upvalue 数组（对象 `upvalues` 裸指针区），随 mark-sweep
+//! 释放（死 cell 随收集释放，full_reset 收尾兜底）；
 //! `flags` 为 1 字节位集加 7 字节固定填充，保证数组元素步长恒定。
 
 use crate::value::JsValue;

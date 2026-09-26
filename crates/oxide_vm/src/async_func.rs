@@ -10,7 +10,7 @@
 
 use oxide_kernel::shape_forge::EMPTY_SHAPE_ID;
 use oxide_runtime_api::{to_boolean, NativeResult};
-use oxide_types::object::{JsObject, NativeFnPtr, PropAttributes};
+use oxide_types::object::{Cell, JsObject, NativeFnPtr, PropAttributes};
 use oxide_types::value::JsValue;
 
 use crate::vm::Vm;
@@ -553,6 +553,24 @@ pub(crate) fn async_native_string_edges(obj: &JsObject) -> Vec<*mut oxide_types:
             out.push(v.as_string_ptr_mut());
         }
     });
+    out
+}
+
+/// 异步挂起帧 cell_stack 的 cell 指针扁平列表（GC mark cell 边）。
+/// 与 `async_native_string_edges` 经同一字段清单（`suspended.cell_stack`）
+/// 产出，cell 指针不经对象图、须独立入存活集。
+pub(crate) fn async_native_cell_edges(obj: &JsObject) -> Vec<*mut Cell> {
+    let Some(state) = async_state_mut(obj) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for cells in &state.suspended.cell_stack {
+        for &cell_ptr in cells {
+            if !cell_ptr.is_null() {
+                out.push(cell_ptr);
+            }
+        }
+    }
     out
 }
 

@@ -3,7 +3,7 @@ use std::mem::size_of;
 use std::time::Instant;
 
 use crate::{vm_debug, vm_info};
-use oxide_types::object::{JsObject, JsString, PropMetaEntry};
+use oxide_types::object::{Cell, JsObject, JsString, PropMetaEntry};
 use oxide_types::value::JsValue;
 use rustc_hash::FxBuildHasher;
 
@@ -32,6 +32,7 @@ pub struct SessionGc {
     pub(crate) mark_stack: Vec<*mut JsObject>,
     pub(crate) live_strings: HashSet<*mut JsString, FxBuildHasher>,
     pub(crate) live_bigints: HashSet<*mut num_bigint::BigInt, FxBuildHasher>,
+    pub(crate) live_cells: HashSet<*mut Cell, FxBuildHasher>,
 }
 
 impl SessionGc {
@@ -47,6 +48,13 @@ impl SessionGc {
     /// 短路，漏扫其新增引用边。
     pub(crate) fn clear_all_marks(&mut self, vm: &mut Vm) {
         vm_debug!("[GC] clear_all_marks: {} session objects", vm.gc_state.session_object_ptrs.len());
+        self.clear_session_marks(vm);
+        self.clear_epoch_marks(vm);
+    }
+
+    /// 只清 session 对象表的 mark 位。移动式 sweep 末尾的旧表对象已全释放/克隆
+    /// （克隆未标记），清位须与表重写同步执行，独立成臂供调用点按需取用。
+    pub(crate) fn clear_session_marks(&mut self, vm: &mut Vm) {
         for &ptr in &vm.gc_state.session_object_ptrs {
             if ptr.is_null() {
                 continue;
@@ -55,8 +63,11 @@ impl SessionGc {
             // session_epoch.alloc，在 arena 存活期间有效。
             unsafe { (*ptr).set_gc_mark(false) };
         }
-        // epoch 臂同清：mark 的 epoch 臂置位不随 session 清位消除，残留位会让
-        // 下一次 mark 的 DFS 短路、漏扫该对象此间新增的边。
+    }
+
+    /// 只清 epoch 对象表的 mark 位。mark 的 epoch 臂置位不随 session 清位消除，
+    /// 残留位会让下一次 mark 的 DFS 短路、漏扫该对象此间新增的边。
+    pub(crate) fn clear_epoch_marks(&mut self, vm: &mut Vm) {
         for &ptr in &vm.gc_state.epoch_object_ptrs {
             if ptr.is_null() {
                 continue;
@@ -138,6 +149,7 @@ impl SessionGc {
         obj: &JsObject, vm: &Vm, stack: &mut Vec<*mut JsObject>,
         live_strings: &mut HashSet<*mut JsString, FxBuildHasher>,
         live_bigints: &mut HashSet<*mut num_bigint::BigInt, FxBuildHasher>,
+        live_cells: &mut HashSet<*mut Cell, FxBuildHasher>,
     ) {
         if let Some(elements) = obj.array_elements_vec() {
             for &value in elements.iter() {
@@ -200,6 +212,9 @@ impl SessionGc {
             for value in module::module_ns_native_edges(obj) {
                 Self::process_edge(value, vm, stack, live_strings, live_bigints);
             }
+            for ptr in module::module_ns_cell_edges(obj) {
+                live_cells.insert(ptr);
+            }
         }
         if obj.is_generator_obj() {
             for value in crate::generator::generator_native_edges(obj) {
@@ -207,6 +222,9 @@ impl SessionGc {
             }
             for ptr in crate::generator::generator_native_string_edges(obj) {
                 Self::mark_string_live(live_strings, ptr);
+            }
+            for ptr in crate::generator::generator_native_cell_edges(obj) {
+                live_cells.insert(ptr);
             }
         }
         if obj.is_promise_obj() {
@@ -221,6 +239,9 @@ impl SessionGc {
             for ptr in crate::async_func::async_native_string_edges(obj) {
                 Self::mark_string_live(live_strings, ptr);
             }
+            for ptr in crate::async_func::async_native_cell_edges(obj) {
+                live_cells.insert(ptr);
+            }
         }
         if obj.is_async_generator_obj() {
             for value in crate::async_generator::async_generator_native_edges(obj) {
@@ -229,17 +250,22 @@ impl SessionGc {
             for ptr in crate::async_generator::async_generator_native_string_edges(obj) {
                 Self::mark_string_live(live_strings, ptr);
             }
+            for ptr in crate::async_generator::async_generator_native_cell_edges(obj) {
+                live_cells.insert(ptr);
+            }
         }
         // RegExp 实例 source/flags 字段持有字符串边。
         if obj.is_regexp_obj() {
             Self::process_edge(obj.get_regexp_source(), vm, stack, live_strings, live_bigints);
             Self::process_edge(obj.get_regexp_flags(), vm, stack, live_strings, live_bigints);
         }
-        // 遍历 upvalue cell 中的引用。
+        // 遍历 upvalue cell 中的引用：cell 指针本身入存活集（对象 upvalues 边
+        // 是 cell 的根面），值边照常走 process_edge。
         for cell_ptr in obj.upvalues_slice() {
             if cell_ptr.is_null() {
                 continue;
             }
+            live_cells.insert(*cell_ptr);
             let cell = unsafe { &**cell_ptr };
             Self::process_edge(cell.value, vm, stack, live_strings, live_bigints);
         }
@@ -449,11 +475,21 @@ impl SessionGc {
             mark_stack: stack,
             live_strings,
             live_bigints,
+            live_cells,
             ..
         } = self;
         stack.clear();
         live_strings.clear();
         live_bigints.clear();
+        live_cells.clear();
+        // 活跃帧 cell_stack 是 cell 的根面（不经对象图）：逐层种子入存活集。
+        for cell_vec in &vm.cell_stack {
+            for &cell_ptr in cell_vec {
+                if !cell_ptr.is_null() {
+                    live_cells.insert(cell_ptr);
+                }
+            }
+        }
         for ptr in string_seeds {
             Self::mark_string_live(live_strings, ptr);
         }
@@ -479,7 +515,7 @@ impl SessionGc {
                     continue;
                 }
                 // P 对象根（builtin world / global）不回收，只扫边。
-                Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints);
+                Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints, live_cells);
             }
         }
 
@@ -494,7 +530,7 @@ impl SessionGc {
                     continue;
                 }
                 obj.set_gc_mark(true);
-                Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints);
+                Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints, live_cells);
             }
         }
     }
@@ -741,7 +777,9 @@ impl SessionGc {
             })
             .sum::<u64>() as usize;
 
-        self.clear_all_marks(vm);
+        // 移动式 sweep 后旧表对象已全释放/克隆（克隆未标记），session 臂空转，
+        // 只清 epoch 臂残留位（epoch 对象存活、位残留）。
+        self.clear_epoch_marks(vm);
 
         let total_ptrs = survivors + dead;
         if total_ptrs > 0 {
@@ -835,6 +873,39 @@ impl SessionGc {
         freed
     }
 
+    /// 清扫 session upvalue cell：保留 `mark()` 阶段记为存活的部分，其余经
+    /// `Box::from_raw` 释放。存活 cell 不被搬移——Box 地址稳定——因此无需
+    /// forwarding 表与根指针重写。在 BigInt 清扫之后运行。
+    ///
+    /// cell 不在 `session_bytes_allocated` 账目口径内（与字符串/BigInt 补回口径
+    /// 不同），故只累计释放字节统计、不重算存活账目。
+    /// 返回释放的字节数。
+    pub(crate) fn sweep_session_cells(&mut self, vm: &mut Vm) -> u64 {
+        let old = vm.gc_state.session_cell_ptrs.borrow_mut().drain(..).collect::<Vec<_>>();
+        let mut freed = 0u64;
+        let mut live = Vec::with_capacity(old.len());
+        for ptr in old {
+            if ptr.is_null() {
+                continue;
+            }
+            if self.live_cells.contains(&ptr) {
+                // 存活——地址不变，无需重写。
+                live.push(ptr);
+            } else {
+                // SAFETY: ptr 在 session_cell_ptrs 中但不可达，恰好释放一次。
+                freed += size_of::<Cell>() as u64;
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
+        *vm.gc_state.session_cell_ptrs.borrow_mut() = live;
+
+        self.total_bytes_freed = self.total_bytes_freed.saturating_add(freed);
+        self.last_collection_bytes_freed = self.last_collection_bytes_freed.saturating_add(freed);
+        freed
+    }
+
     /// 完整收集的触发判断：对象、字符串或 BigInt 表非空，且字节账目已达阈值。
     pub(crate) fn should_collect(&self, vm: &Vm) -> bool {
         (!vm.gc_state.session_object_ptrs.is_empty()
@@ -889,6 +960,7 @@ impl SessionGc {
         let mut freed_bytes = self.sweep(vm);
         freed_bytes += self.sweep_session_strings(vm);
         freed_bytes += self.sweep_session_bigints(vm);
+        freed_bytes += self.sweep_session_cells(vm);
 
         let elapsed = start.elapsed();
         self.total_collections += 1;
@@ -957,6 +1029,7 @@ impl SessionGc {
         vm.gc_state.session_bytes_allocated = object_bytes;
         let mut freed_bytes = self.sweep_session_strings(vm);
         freed_bytes += self.sweep_session_bigints(vm);
+        freed_bytes += self.sweep_session_cells(vm);
 
         // 恢复 mark 位不变量：mark 之后必由清位收尾（与 sweep 末尾同点清位）。
         // 残留 marked 对象会让下一次完整收集（reset 路径）的 mark DFS 短路漏标，
@@ -1098,6 +1171,9 @@ impl SessionGc {
             }
             // SAFETY: ptr 来自 session 对象表登记，arena 存活期内有效。
             if unsafe { (*ptr).is_gc_marked() } {
+                // 原地 sweep 不搬移对象：存活对象带位保留，清位并入活分支
+                // （收集后无残留，残留 true 使下一次 mark DFS 短路漏标）。
+                unsafe { (*ptr).set_gc_mark(false) };
                 survivors.push(ptr);
             } else {
                 session_freed += Self::drop_dead_session_object(ptr);
@@ -1107,8 +1183,8 @@ impl SessionGc {
         let live_session = survivors.len() as u64;
         vm.gc_state.session_object_ptrs = survivors;
 
-        // 恢复 mark 位不变量：收集后无残留（残留 true 使下一次 mark DFS 短路漏标）。
-        self.clear_all_marks(vm);
+        // 死 cell 随死对象出表：存活 cell 经 mark 种子 + 对象边入存活集，此处清扫。
+        self.sweep_session_cells(vm);
 
         // 对象口径重算：存活对象 + 存活串 + BigInt（串/BigInt 本路径不动，
         // 随公式整体重算保持与 strings-only 口径一致）。
@@ -1242,6 +1318,7 @@ impl Default for SessionGc {
             mark_stack: Vec::new(),
             live_strings: HashSet::default(),
             live_bigints: HashSet::default(),
+            live_cells: HashSet::default(),
         }
     }
 }

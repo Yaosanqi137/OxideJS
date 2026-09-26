@@ -151,8 +151,8 @@ fn push_entry(table: *mut ModuleNsTable, name_si: u32, origin: ModuleNsOrigin, s
 /// - 返回 `Initialized(v)`：`Value` 已初始化，或 cell 已初始化。
 ///
 /// # 注意事项
-/// - `Cell` 读依赖「cell 由 `alloc_cell` 分配并登记，至 `full_reset` 才统一释放」
-///   的生命周期契约；同一 VM 世代内指针有效。
+/// - `Cell` 读依赖「cell 由 `alloc_cell` 分配并登记，参与 mark-sweep 回收、
+///   `full_reset` 为收尾兜底」的生命周期契约；同一 VM 世代内指针有效。
 pub fn module_ns_export(obj: &JsObject, key_si: u32) -> Option<ModuleNsQuery> {
     let table = ns_table_ptr(obj);
     if table.is_null() {
@@ -177,7 +177,7 @@ pub fn module_ns_export(obj: &JsObject, key_si: u32) -> Option<ModuleNsQuery> {
             if cell.is_null() {
                 return Some(ModuleNsQuery::Uninitialized);
             }
-            // SAFETY: cell 由 alloc_cell 分配并登记，至 full_reset 才释放。
+            // SAFETY: cell 由 alloc_cell 分配并登记，参与 mark-sweep、full_reset 收尾兜底。
             let cell_ref = unsafe { &**cell };
             if cell_ref.is_initialized() {
                 Some(ModuleNsQuery::Initialized(cell_ref.value))
@@ -213,6 +213,26 @@ pub fn module_ns_native_edges(obj: &JsObject) -> Vec<JsValue> {
         }
     }
     edges
+}
+
+/// 收集条目表持有的共享 cell 指针（`Cell` 条目），供 GC mark cell 边。
+/// cell 指针不经对象图、须独立入存活集（与 `module_ns_native_edges` 的值边互补）。
+pub fn module_ns_cell_edges(obj: &JsObject) -> Vec<*mut Cell> {
+    let table = ns_table_ptr(obj);
+    if table.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: table 归本 ns 对象持有，生命周期见 `module_ns_export`。
+    let table_ref = unsafe { &*table };
+    let mut out = Vec::new();
+    for entry in &table_ref.entries {
+        if let ModuleNsState::Cell(cell) = &entry.state {
+            if !cell.is_null() {
+                out.push(*cell);
+            }
+        }
+    }
+    out
 }
 
 /// 原地重写条目表内的 JsValue 边（对象搬移/epoch 晋升后的引用重定位）。
@@ -554,7 +574,7 @@ pub fn module_set_cell<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let Some(cell) = vm.module_frame_cell(cell_idx) else {
         return type_error(vm, "__moduleSetCell: cell is not available");
     };
-    // SAFETY: cell 由 alloc_cell 分配并登记，至 full_reset 才释放。
+    // SAFETY: cell 由 alloc_cell 分配并登记，参与 mark-sweep、full_reset 收尾兜底。
     let value = unsafe { (*cell).value };
     // SAFETY: idx 来自刚完成的表内查找，仍在界内。
     unsafe {

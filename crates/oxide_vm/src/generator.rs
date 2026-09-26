@@ -9,7 +9,7 @@
 use oxide_builtins::iterator::{is_callable, make_iter_result};
 use oxide_kernel::shape_forge::EMPTY_SHAPE_ID;
 use oxide_runtime_api::{to_boolean, NativeResult};
-use oxide_types::object::{JsObject, NativeFnPtr};
+use oxide_types::object::{Cell, JsObject, NativeFnPtr};
 use oxide_types::value::JsValue;
 
 use crate::vm::Vm;
@@ -936,6 +936,24 @@ pub(crate) fn generator_native_string_edges(obj: &JsObject) -> Vec<*mut oxide_ty
             out.push(v.as_string_ptr_mut());
         }
     });
+    out
+}
+
+/// 生成器挂起帧 cell_stack 的 cell 指针扁平列表（GC mark cell 边）。
+/// 与 `generator_native_string_edges` 经同一字段清单（`suspended.cell_stack`）
+/// 产出，cell 指针不经对象图、须独立入存活集。
+pub(crate) fn generator_native_cell_edges(obj: &JsObject) -> Vec<*mut Cell> {
+    let Some(state) = generator_state_mut(obj) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for cells in &state.suspended.cell_stack {
+        for &cell_ptr in cells {
+            if !cell_ptr.is_null() {
+                out.push(cell_ptr);
+            }
+        }
+    }
     out
 }
 

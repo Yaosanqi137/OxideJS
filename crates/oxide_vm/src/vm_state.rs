@@ -36,7 +36,8 @@ pub(crate) struct GcState {
     pub(crate) session_bigint_ptrs: RefCell<Vec<*mut num_bigint::BigInt>>,
     /// upvalue cell（`Box<Cell>`）追踪表。`RefCell` 使 `&self` 的分配入口也能
     /// 登记新 box。cell 独立堆分配、地址稳定，不参与对象搬移（sweep 只重写
-    /// `cell.value` 中的对象引用），只在 full_reset 统一释放。
+    /// `cell.value` 中的对象引用）；参与 mark-sweep 回收（死 cell 随收集释放），
+    /// full_reset 为收尾兜底（表已空时 no-op）。
     pub(crate) session_cell_ptrs: RefCell<Vec<*mut UpvalueCell>>,
     pub(crate) session_bytes_allocated: usize,
     /// 执行期 session 堆账目的峰值高水位（`session_bytes_allocated` 的采样上界），
@@ -82,8 +83,9 @@ impl GcState {
         ptr
     }
 
-    /// 释放全部 session 堆 upvalue cell box。仅在完全隔离重置（`full_reset`）时调用，
-    /// 此时没有存活的 cell_stack / 函数对象 upvalues 会引用它们。
+    /// 释放全部 session 堆 upvalue cell box（收尾兜底，幂等）。仅在完全隔离重置
+    /// （`full_reset`）时调用，此时没有存活的 cell_stack / 函数对象 upvalues 会引用
+    /// 它们；mark-sweep 已释放的死 cell 已出表，表内残留为收集后仍登记的存活 cell。
     pub(crate) fn free_cells(&mut self) {
         for ptr in self.session_cell_ptrs.borrow_mut().drain(..) {
             // SAFETY: 每个指针来自 alloc_cell 的 Box::into_raw(Box::new(Cell))，
