@@ -47,6 +47,25 @@ fn read_pc_scene(path: &Path) -> Option<String> {
     }
 }
 
+/// 读 sidecar 日志的末 `n` 行：文件缺失/空返回 None，有内容时返回整文件或
+/// 末 N 行（超时/崩溃后供现场重建）。
+fn tail_lines(path: &Path, n: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    if start == lines.len() {
+        return None;
+    }
+    Some(lines[start..].join("\n"))
+}
+
+/// 超时/崩溃后把 sidecar 日志的末 ~20 行打到父进程 stderr，供现场重建。
+fn print_log_tail(window_id: usize, path: &Path) {
+    if let Some(tail) = tail_lines(path, 20) {
+        eprintln!("  [log tail] window {window_id}:\n{tail}");
+    }
+}
+
 /// 记一笔超时/崩溃结果：默认计入 skip，`--no-skip` 下计入 fail（归入
 /// `timeout/crash` 类别，父进程无法进一步拆分根因）。
 ///
@@ -82,6 +101,8 @@ fn supervise_window(
     // 旁路失败行已消费字节偏移：跨重启只并入新增段（见 merge_fail_log）。
     let mut fails_consumed: usize = 0;
     let hb_path = std::env::temp_dir().join(format!("oxide_t262_hb_{}_{}.txt", std::process::id(), window_id));
+    // sidecar 日志：子进程 stdout/stderr 双写此文件（与 .fails 同目录同生命周期）。
+    let log_path = hb_path.with_extension("log");
     // last-pc 现场文件：子进程运行期定频追加写，监督者杀子进程后读回末行。
     let pc_path = std::env::temp_dir().join(format!("oxide_t262_pc_{}_{}.txt", std::process::id(), window_id));
 
@@ -93,15 +114,28 @@ fn supervise_window(
     };
 
     while cur < wend {
-        // 心跳文件每子进程重开；旁路失败行跨重启保留（追加而非清空）：
-        // 超时/崩溃重启若删旁路会丢掉此前子进程的全部失败记录，收尾差分
-        // 只剩末段。merge_fail_log 按已消费字节偏移只并入新增段（每行恰
+        // 心跳文件每子进程重开；旁路失败行与 sidecar 日志跨重启保留（追加而非
+        // 清空）：超时/崩溃重启若删旁路会丢掉此前子进程的全部失败记录与输出，
+        // 收尾差分只剩末段。merge_fail_log 按已消费字节偏移只并入新增段（每行恰
         // 并入一次）；重跑测试至多重录一条（心跳先写、旁路后追加的写序），
         // 新行是真实新事件而非重复并入。
         let _ = std::fs::remove_file(&hb_path);
         let _ = std::fs::remove_file(format!("{}.tmp", hb_path.display()));
         let _ = std::fs::remove_file(&pc_path);
         let max_tests = wend - cur;
+
+        // sidecar 日志经手：子进程 stdout/stderr 双写此文件（直接文件写，无
+        // pipe 缓冲死锁面）；打开失败回退丢弃，不中断运行。
+        let (stdout, stderr) = match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            Ok(file) => {
+                // 文件经手克隆：底层 fd 复制，stdout/stderr 各持一份。
+                let err_file = file.try_clone().expect("sidecar 日志经手克隆失败");
+                let out = std::process::Stdio::from(file);
+                let err = std::process::Stdio::from(err_file);
+                (out, err)
+            }
+            Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
+        };
 
         let mut child = match Command::new(exe)
             .args(args.iter().skip(1))
@@ -113,8 +147,8 @@ fn supervise_window(
             .env("OXIDE_TEST262_CHILD_CHUNK", "1")
             .env("OXIDE_TEST262_ALLOW_FAIL_EXIT", "1")
             .env_remove("OXIDE_TEST262_CHUNK_SIZE")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
             .spawn()
         {
             Ok(child) => child,
@@ -150,6 +184,7 @@ fn supervise_window(
                                 culprit,
                                 describe(culprit)
                             );
+                            print_log_tail(window_id, &log_path);
                             record_timeout_or_crash(&mut stats, no_skip, culprit, 0, scene.as_deref());
                             cur = culprit;
                         }
@@ -159,6 +194,7 @@ fn supervise_window(
                             );
                             merge_fail_log(&mut stats, &hb_path, &mut fails_consumed);
                             let scene = read_pc_scene(&pc_path);
+                            print_log_tail(window_id, &log_path);
                             record_timeout_or_crash(&mut stats, no_skip, cur, 0, scene.as_deref());
                             cur += 1;
                         }
@@ -173,6 +209,7 @@ fn supervise_window(
                     let _ = child.wait();
                     merge_fail_log(&mut stats, &hb_path, &mut fails_consumed);
                     let scene = read_pc_scene(&pc_path);
+                    print_log_tail(window_id, &log_path);
                     record_timeout_or_crash(&mut stats, no_skip, cur, 0, scene.as_deref());
                     cur += 1;
                     break;
@@ -209,6 +246,7 @@ fn supervise_window(
                     describe(culprit),
                     scene.as_deref().map(|s| format!("  [{s}]")).unwrap_or_default()
                 );
+                print_log_tail(window_id, &log_path);
                 record_timeout_or_crash(&mut stats, no_skip, culprit, elapsed.as_millis() as u64, scene.as_deref());
                 cur = culprit + 1;
                 break;
@@ -224,6 +262,8 @@ fn supervise_window(
     // 旁路失败行归档而非删除：统计已由心跳合并入父进程，此文件是收尾逐文件
     // 差分的终态依据（删除即永久丢记录）。
     let _ = std::fs::rename(hb_path.with_extension("fails"), hb_path.with_extension("fails.done"));
+    // sidecar 日志同式归档：整窗子进程输出是现场重建的终态依据。
+    let _ = std::fs::rename(&log_path, log_path.with_extension("log.done"));
     stats
 }
 
@@ -417,6 +457,22 @@ mod tests {
         // 残行：末行缺 frames 字段，返回 None。
         std::fs::write(&path, "pc=1 op=ADD flat_id=0 frames=1\npc=2 op=AD").expect("写失败");
         assert_eq!(read_pc_scene(&path), None, "残行返回 None");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// tail_lines 防御解析：缺文件 / 空文件返回 None，不足 N 行返回整文件，
+    /// 超出 N 行只取末 N 行。
+    #[test]
+    fn tail_lines_defensive_parse() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oxide_t262_log_test_{}.log", std::process::id()));
+        assert_eq!(tail_lines(&path, 20), None, "缺文件返回 None");
+        std::fs::write(&path, "").expect("写失败");
+        assert_eq!(tail_lines(&path, 20), None, "空文件返回 None");
+        std::fs::write(&path, "a\nb\n").expect("写失败");
+        assert_eq!(tail_lines(&path, 20), Some("a\nb".to_string()), "不足 N 行返回整文件");
+        std::fs::write(&path, "1\n2\n3\n4\n").expect("写失败");
+        assert_eq!(tail_lines(&path, 2), Some("3\n4".to_string()), "超出 N 行取末 N 行");
         let _ = std::fs::remove_file(&path);
     }
 

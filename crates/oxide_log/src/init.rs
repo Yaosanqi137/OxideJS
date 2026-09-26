@@ -3,11 +3,16 @@
 //! `init` 一次性初始化全局 `tracing` subscriber，输出可定向到 stderr / stdout /
 //! 按日滚动的文件；[`set_level`] 与 `get_subsystem` 提供运行期级别控制。
 //! 重复调用 `init` 幂等（内部 `Once`），后续调用不生效。
+//! 时间戳统一毫秒精度（`MillisTime`，`epoch秒.毫秒`），供 GC 周期关联与
+//! 跨进程现场拼接。
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Once, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -16,6 +21,17 @@ use tracing_subscriber::Layer;
 use crate::filter::SubsystemFilter;
 use crate::level::Level;
 use crate::subsystem::{self, SubsystemId, SUBSYSTEM_COUNT};
+
+/// 毫秒精度时间戳：tracing 缺省 `SystemTime` 为秒精度，GC 周期关联与跨进程
+/// 现场拼接需要毫秒级；输出 `epoch秒.毫秒`。
+struct MillisTime;
+
+impl FormatTime for MillisTime {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        write!(w, "{}.{:03}", now.as_secs(), now.subsec_millis())
+    }
+}
 
 /// 日志输出目标。
 #[derive(Debug, Clone)]
@@ -92,7 +108,7 @@ pub fn init(config: &LogConfig) {
         let stderr_layer = tracing_subscriber::fmt::Layer::default()
             .with_writer(io::stderr)
             .with_ansi(false)
-            .without_time()
+            .with_timer(MillisTime)
             .compact();
 
         match &config.output {
@@ -106,7 +122,7 @@ pub fn init(config: &LogConfig) {
                 let stdout_layer = tracing_subscriber::fmt::Layer::default()
                     .with_writer(io::stdout)
                     .with_ansi(false)
-                    .without_time()
+                    .with_timer(MillisTime)
                     .compact();
                 let subscriber = tracing_subscriber::Registry::default()
                     .with(env_filter)
@@ -121,7 +137,7 @@ pub fn init(config: &LogConfig) {
                 let file_layer = tracing_subscriber::fmt::Layer::default()
                     .with_writer(non_blocking)
                     .with_ansi(false)
-                    .without_time()
+                    .with_timer(MillisTime)
                     .compact();
 
                 let subscriber = tracing_subscriber::Registry::default()
