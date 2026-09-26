@@ -63,6 +63,9 @@ pub fn run_js_stress_bench(config: &BenchConfig, kernel: &Arc<KernelCore>, pool:
             }
         };
 
+        // 编译在计时循环外一次性完成：每文件唯一结构哈希，首轮即冷编译，
+        // 后续迭代命中 CodeForge 缓存，compile_time 记首轮真实编译时长
+        let compile_start = Instant::now();
         let hash = compiled_module_hash(&program);
         let module = match kernel.code_forge().get_or_insert_with(hash, || compiler.compile(&program)) {
             Ok(m) => m,
@@ -71,6 +74,7 @@ pub fn run_js_stress_bench(config: &BenchConfig, kernel: &Arc<KernelCore>, pool:
                 continue;
             }
         };
+        let compile_time = compile_start.elapsed();
 
         for _ in 0..config.warmup {
             let mut guard = pool.spawn();
@@ -79,10 +83,8 @@ pub fn run_js_stress_bench(config: &BenchConfig, kernel: &Arc<KernelCore>, pool:
 
         let mut metrics = Vec::new();
         for _ in 0..config.iterations {
-            let compile_start = Instant::now();
             let mut guard = pool.spawn();
             let vm = guard.vm_mut();
-            let compile_time = compile_start.elapsed();
 
             let pre_session = vm.session_object_count();
             let pre_epoch = vm.epoch_object_count();
