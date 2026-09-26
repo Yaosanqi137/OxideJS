@@ -5,7 +5,7 @@ use oxide_types::object::JsObject;
 use oxide_types::private_key::{int_key_value, is_int_key, make_int_key, make_private_name_id};
 use oxide_types::value::JsValue;
 
-use crate::ic_helper::{self, ic_get_hit, ic_set_hit};
+use crate::ic_helper::{self, ic_get_hit, ic_set_hit, VIRTUAL_LENGTH_SLOT};
 use crate::vm::{Vm, MAX_PROTO_CHAIN_DEPTH};
 
 #[cold]
@@ -377,6 +377,14 @@ impl Vm {
             let prop_name_si = self.property_key_si(self.regs[b])?;
             self.profiling.record_ic_miss();
             prop_cache_miss();
+            // 数组 length 虚拟槽：Array.prototype 无 own length，写回恒落空；
+            // 直接学入标记并读逻辑长度，跳过模板查 / ordinary_get / proto 空跑。
+            if obj.is_array() && prop_name_si == self.length_si {
+                ic_helper::write_ic_back(self.bytecode_mut(), ic_pc, obj.shape_id(), VIRTUAL_LENGTH_SLOT, 0);
+                ic_debug!("IC_GET virtual length hit shape={}", obj.shape_id());
+                self.regs[a] = obj.logical_len_value();
+                return Ok(());
+            }
             // 模板快路径：prop_forge 只缓存每 shape 最后新增的属性，恰好覆盖该属性时直取槽位。
             if let Some(template) = self.kernel_core.prop_forge().get_template(obj.shape_id()) {
                 if template.prop_name == prop_name_si && template.position < obj.prop_vec_len() as u32 {

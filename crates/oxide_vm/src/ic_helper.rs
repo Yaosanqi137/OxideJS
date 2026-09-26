@@ -12,11 +12,18 @@
 //! - miss 写回 FIFO 滚动：新条目进槽 0、原槽 0..2 顺移到槽 1..3、槽 3 丢弃，
 //!   空槽恒在尾部连续——命中遍历遇空槽即可 break。
 //! - 命中路径零写：只读扩展字 + Cell 计数，不触发 bytecode COW。
+//! - `slot_index == [`VIRTUAL_LENGTH_SLOT`]` 为数组虚拟长度标记，不对应任何实际槽，
+//!   命中判定必须带 `is_array()` 守卫（`EMPTY_SHAPE_ID` 跨对象类型共享）。
 
 use crate::vm_trace;
 use oxide_bytecode::opcode::{self, ext_word_count, Instr, IC_EXT_WORDS, IC_SLOTS};
 use oxide_types::object::JsObject;
 use oxide_types::value::JsValue;
+
+/// 数组虚拟长度标记槽：与真实槽空间不相交（`prop_vec_len` 远小于 `u32::MAX`），
+/// 供 `arr.length` 读快路径使用——Array.prototype 无 own length 槽，写回恒落空，
+/// miss 时直接学入本标记，命中时读逻辑长度。
+pub(crate) const VIRTUAL_LENGTH_SLOT: u32 = u32::MAX;
 
 /// 读取 `pc` 处 IC 指令槽 0 的三元组并把 `pc` 推进越过全部扩展字（单态快路径用）。
 /// 槽编码：[shape_id(24)|proto_depth(8)] [slot(32)]。
@@ -96,6 +103,11 @@ pub(crate) fn ic_get_hit(obj: &JsObject, shape_id: u32, slot_index: u32, proto_d
         return None;
     }
     if proto_depth == 0 {
+        // 虚拟长度标记：EMPTY_SHAPE_ID 跨对象类型共享，守卫必须带 is_array()，
+        // 防无属性普通对象（shape 1）误命中返回 0。
+        if obj.is_array() && obj.shape_id() == shape_id && slot_index == VIRTUAL_LENGTH_SLOT {
+            return Some(obj.logical_len_value());
+        }
         if obj.shape_id() == shape_id && slot_index < obj.prop_vec_len() as u32 {
             let v = obj.get_prop_shape(slot_index);
             return Some(v);
@@ -127,6 +139,9 @@ pub(crate) fn ic_get_hit_poly(obj: &JsObject, bytecode: &[Instr], ext_pc: usize)
         let slot_index = bytecode[base + 1];
         let proto_depth = (bytecode[base] >> 24) as u8;
         if proto_depth == 0 {
+            if obj.is_array() && obj.shape_id() == shape_id && slot_index == VIRTUAL_LENGTH_SLOT {
+                return Some(obj.logical_len_value());
+            }
             if obj.shape_id() == shape_id && slot_index < obj.prop_vec_len() as u32 {
                 let v = obj.get_prop_shape(slot_index);
                 return Some(v);
@@ -254,6 +269,7 @@ fn ic_set_hit_own_poly(obj: &mut JsObject, bytecode: &[Instr], ext_pc: usize, va
 mod tests {
     use super::*;
     use oxide_bytecode::opcode::OpCode;
+    use oxide_types::shape::EMPTY_SHAPE_ID;
 
     #[test]
     fn concat_n_ext_word_count_advances_by_n() {
@@ -366,5 +382,20 @@ mod tests {
         assert_eq!(bc[5], 2);
         assert_eq!(bc[6], 0xA3);
         assert_eq!(bc[7], 3);
+    }
+
+    #[test]
+    fn ic_get_hit_virtual_length_marker_hits_array() {
+        // shape 1（空形状）数组经虚拟长度标记命中：返回逻辑长度。
+        let bump = bumpalo::Bump::new();
+        let arr = JsObject::new_array(EMPTY_SHAPE_ID, JsValue::null(), 3, &bump);
+        assert_eq!(ic_get_hit(&arr, EMPTY_SHAPE_ID, VIRTUAL_LENGTH_SLOT, 0), Some(JsValue::int(3)));
+    }
+
+    #[test]
+    fn ic_get_hit_virtual_length_marker_rejects_non_array() {
+        // 同 shape 1 的普通对象（EMPTY_SHAPE_ID 跨对象类型共享）不得误命中虚拟长度标记。
+        let plain = JsObject::new_empty(EMPTY_SHAPE_ID, JsValue::null());
+        assert_eq!(ic_get_hit(&plain, EMPTY_SHAPE_ID, VIRTUAL_LENGTH_SLOT, 0), None);
     }
 }
