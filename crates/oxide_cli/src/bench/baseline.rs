@@ -48,6 +48,7 @@ pub fn save_baseline(results: &[MetricCollection]) -> Result<(), String> {
 }
 
 /// 对比当前结果与基线，返回所有超过各自容差（wall_time 10%、GC 类 50%、其它 20%）的回归项。
+/// 方向语义：`ic_hit_rate` 越高越好（下降超容差才报回归），其余指标越低越好（上升超容差报回归）。
 pub fn compare_baseline(current: &[MetricCollection]) -> Vec<Regression> {
     let baseline = match load_baseline() {
         Ok(b) => b,
@@ -83,7 +84,12 @@ pub fn compare_baseline(current: &[MetricCollection]) -> Vec<Regression> {
                     _ => 0.20,
                 };
                 let ratio = cur_val / base_val;
-                if ratio > 1.0 + tolerance {
+                let regressed = if matches!(name, "ic_hit_rate") {
+                    ratio < 1.0 - tolerance
+                } else {
+                    ratio > 1.0 + tolerance
+                };
+                if regressed {
                     regressions.push(Regression {
                         metric: name.to_string(),
                         test_name: cur.test_name.clone(),
