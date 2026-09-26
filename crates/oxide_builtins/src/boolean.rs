@@ -18,7 +18,9 @@ pub fn boolean_constructor<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
             // SAFETY: arg 已确认是字符串值。
             !unsafe { (*arg.as_string_ptr()).is_empty() }
         } else if arg.is_object() {
-            true
+            // [[IsHTMLDDA]] 宿主对象按 undefined 处理（B.3.4），falsy。
+            // SAFETY: arg 已确认是对象值，借用即时消费。
+            !unsafe { (*arg.as_js_object_ptr()).is_html_dda_obj() }
         } else if arg.is_int() {
             arg.as_int() != 0
         } else if arg.is_double() {
