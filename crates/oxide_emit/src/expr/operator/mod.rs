@@ -648,12 +648,53 @@ impl Emitter {
                     // 全局不可写内置：值照算（前缀返回新值、后缀返回旧值），跳过槽写。
                     let tmp_reg = ctx.alloc_reg();
                     ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(tmp_reg), Operand::Reg(reg), Operand::None));
-                    let result_reg = ctx.alloc_reg();
-                    ctx.inst(Inst::new(op, Operand::Reg(tmp_reg), Operand::Reg(result_reg), Operand::Reg(result_reg)));
+                    // 后缀形：增减指令把转换后旧值写临时寄存器、新值写新鲜寄存器
+                    //（新鲜寄存器活区间跨指令，别名写不冲毁活值），结果返旧值。
+                    let result_reg = if update.prefix {
+                        // 前缀形：新值直接落临时寄存器，a 槽别名 rd 合并双写。
+                        ctx.inst(Inst::new(op, Operand::Reg(tmp_reg), Operand::Reg(tmp_reg), Operand::None));
+                        tmp_reg
+                    } else {
+                        let old_reg = ctx.alloc_reg();
+                        ctx.inst(Inst::new(
+                            OpCode::LOAD_VAR,
+                            Operand::Reg(old_reg),
+                            Operand::Reg(tmp_reg),
+                            Operand::None,
+                        ));
+                        ctx.inst(Inst::new(op, Operand::Reg(old_reg), Operand::Reg(tmp_reg), Operand::None));
+                        let result_reg = ctx.alloc_reg();
+                        ctx.inst(Inst::new(
+                            OpCode::LOAD_VAR,
+                            Operand::Reg(result_reg),
+                            Operand::Reg(tmp_reg),
+                            Operand::None,
+                        ));
+                        ctx.inst(Inst::new(
+                            OpCode::LOAD_VAR,
+                            Operand::Reg(tmp_reg),
+                            Operand::Reg(old_reg),
+                            Operand::None,
+                        ));
+                        result_reg
+                    };
                     return Ok(result_reg);
                 }
-                let result_reg = ctx.alloc_reg();
-                ctx.inst(Inst::new(op, Operand::Reg(reg), Operand::Reg(result_reg), Operand::Reg(result_reg)));
+                // 后缀形：增减指令把转换后旧值写循环变量寄存器、新值写新鲜寄存器
+                //（新鲜寄存器活区间跨指令，别名写不冲毁活值），结果返旧值。
+                let result_reg = if update.prefix {
+                    // 前缀形：新值直接落循环变量寄存器，a 槽别名 rd 合并双写。
+                    ctx.inst(Inst::new(op, Operand::Reg(reg), Operand::Reg(reg), Operand::None));
+                    reg
+                } else {
+                    let old_reg = ctx.alloc_reg();
+                    ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(old_reg), Operand::Reg(reg), Operand::None));
+                    ctx.inst(Inst::new(op, Operand::Reg(old_reg), Operand::Reg(reg), Operand::None));
+                    let result_reg = ctx.alloc_reg();
+                    ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(result_reg), Operand::Reg(reg), Operand::None));
+                    ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(reg), Operand::Reg(old_reg), Operand::None));
+                    result_reg
+                };
                 // 可写内置名：RMW 新值同步落全局对象属性。
                 if ctx.targets_writable_builtin(name, reg) {
                     self.emit_global_put_write(name, reg, ctx);
@@ -737,14 +778,32 @@ impl Emitter {
                 }
                 let tmp_reg = ctx.alloc_reg();
                 ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(tmp_reg), Operand::Reg(var_reg), Operand::None));
-                let result_reg = ctx.alloc_reg();
                 let op = match (update.operator, update.prefix) {
                     (UpdateOperator::Increment, true) => OpCode::INC_PRE,
                     (UpdateOperator::Increment, false) => OpCode::INC_POST,
                     (UpdateOperator::Decrement, true) => OpCode::DEC_PRE,
                     (UpdateOperator::Decrement, false) => OpCode::DEC_POST,
                 };
-                ctx.inst(Inst::new(op, Operand::Reg(tmp_reg), Operand::Reg(result_reg), Operand::Reg(result_reg)));
+                // 后缀形：增减指令把转换后旧值写临时寄存器、新值写新鲜寄存器
+                //（新鲜寄存器活区间跨指令，别名写不冲毁活值），结果返旧值。
+                let result_reg = if update.prefix {
+                    // 前缀形：新值直接落临时寄存器，a 槽别名 rd 合并双写。
+                    ctx.inst(Inst::new(op, Operand::Reg(tmp_reg), Operand::Reg(tmp_reg), Operand::None));
+                    tmp_reg
+                } else {
+                    let old_reg = ctx.alloc_reg();
+                    ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(old_reg), Operand::Reg(tmp_reg), Operand::None));
+                    ctx.inst(Inst::new(op, Operand::Reg(old_reg), Operand::Reg(tmp_reg), Operand::None));
+                    let result_reg = ctx.alloc_reg();
+                    ctx.inst(Inst::new(
+                        OpCode::LOAD_VAR,
+                        Operand::Reg(result_reg),
+                        Operand::Reg(tmp_reg),
+                        Operand::None,
+                    ));
+                    ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(tmp_reg), Operand::Reg(old_reg), Operand::None));
+                    result_reg
+                };
                 return Ok(result_reg);
             }
             let is_tier = self.is_global_tier_name(ctx, name);
@@ -764,14 +823,32 @@ impl Emitter {
                     Operand::None,
                 ));
             }
-            let result_reg = ctx.alloc_reg();
             let op = match (update.operator, update.prefix) {
                 (UpdateOperator::Increment, true) => OpCode::INC_PRE,
                 (UpdateOperator::Increment, false) => OpCode::INC_POST,
                 (UpdateOperator::Decrement, true) => OpCode::DEC_PRE,
                 (UpdateOperator::Decrement, false) => OpCode::DEC_POST,
             };
-            ctx.inst(Inst::new(op, Operand::Reg(var_reg), Operand::Reg(result_reg), Operand::Reg(result_reg)));
+            // 后缀形：增减指令把转换后旧值写槽寄存器（取数之后）、新值写新鲜寄存器
+            //（新鲜寄存器活区间跨指令，别名写不冲毁活值），结果返旧值。
+            let result_reg = if update.prefix {
+                // 前缀形：新值直接落槽寄存器，a 槽别名 rd 合并双写。
+                ctx.inst(Inst::new(op, Operand::Reg(var_reg), Operand::Reg(var_reg), Operand::None));
+                var_reg
+            } else {
+                let old_reg = ctx.alloc_reg();
+                ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(old_reg), Operand::Reg(var_reg), Operand::None));
+                ctx.inst(Inst::new(op, Operand::Reg(old_reg), Operand::Reg(var_reg), Operand::None));
+                let result_reg = ctx.alloc_reg();
+                ctx.inst(Inst::new(
+                    OpCode::LOAD_VAR,
+                    Operand::Reg(result_reg),
+                    Operand::Reg(var_reg),
+                    Operand::None,
+                ));
+                ctx.inst(Inst::new(OpCode::LOAD_VAR, Operand::Reg(var_reg), Operand::Reg(old_reg), Operand::None));
+                result_reg
+            };
             if is_tier {
                 // 顶层已声明 var 自增/自减：新值写入全局对象属性（顶层 var 的唯一存储，
                 // 引擎侧不保留镜像副本）。
@@ -782,8 +859,8 @@ impl Emitter {
                 // 可写内置名：RMW 新值同步落全局对象属性。
                 self.emit_global_put_write(name, var_reg, ctx);
             }
-            // 槽位寄存器 rd 承载更新后的新值：后缀形式 result_reg 保留旧值，
-            // 写穿必须取 var_reg，否则命名空间条目被写回旧值。
+            // 槽位寄存器承载更新后的新值：写穿必须取 var_reg，
+            // 否则命名空间条目被写回旧值。
             self.emit_module_write_through(name, var_reg, ctx)?;
             Ok(result_reg)
         }

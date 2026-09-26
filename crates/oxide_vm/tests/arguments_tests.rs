@@ -180,3 +180,27 @@ fn top_level_fn_named_arguments_suppresses_object() {
     let result = eval_str(&mut vm, "function f(){return typeof arguments; function arguments(){}} f()");
     assert_eq!(result, "function");
 }
+
+#[test]
+fn global_self_increment_preserves_arguments() {
+    // 全局自增减（后缀）在槽寄存器内计算，arguments 对象不被别名写冲毁。
+    let mut vm = Vm::new();
+    let result = eval(&mut vm, "function f(a){c++; return arguments.length} f(1)").unwrap();
+    assert_eq!(result.as_int(), 1);
+}
+
+#[test]
+fn global_prefix_self_increment_preserves_arguments() {
+    // 顶层声明 var 的前缀自增同形：新值落槽寄存器，arguments 对象完好。
+    let mut vm = Vm::new();
+    let result = eval(&mut vm, "var c=1; function f(a){++c; return arguments.length} f(1)").unwrap();
+    assert_eq!(result.as_int(), 1);
+}
+
+#[test]
+fn global_self_decrement_preserves_arguments() {
+    // 顶层声明 var 的后缀自减同形：arguments 对象完好。
+    let mut vm = Vm::new();
+    let result = eval(&mut vm, "var c=1; function f(a){c--; return arguments.length} f(1)").unwrap();
+    assert_eq!(result.as_int(), 1);
+}

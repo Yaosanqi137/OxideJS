@@ -278,13 +278,8 @@ impl Emitter {
             Operand::Reg(idx_reg),
             Operand::Reg(val_reg),
         ));
-        let tmp_reg = ctx.alloc_reg();
-        ctx.inst(Inst::new(
-            OpCode::INC_PRE,
-            Operand::Reg(idx_reg),
-            Operand::Reg(tmp_reg),
-            Operand::Reg(tmp_reg),
-        ));
+        // a 槽别名 rd：增减指令双写合并为一次，idx_reg 新值供下一轮 SET_ELEM 使用。
+        ctx.inst(Inst::new(OpCode::INC_PRE, Operand::Reg(idx_reg), Operand::Reg(idx_reg), Operand::None));
         ctx.inst(Inst::jmp(loop_start));
         ctx.labels.set_label_pos(loop_end, ctx.insts.len());
         Ok(rest_reg)
