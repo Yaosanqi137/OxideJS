@@ -6,6 +6,7 @@ use std::sync::Arc;
 use oxide_runtime_api::NativeResult;
 use oxide_types::object::JsObject;
 use oxide_types::value::JsValue;
+use smallvec::SmallVec;
 
 use super::frames::{CallFrame, FrameArgs, FrameContinuation};
 use super::{native_fn_ptr_to_fn, Vm};
@@ -13,11 +14,14 @@ use crate::native::NativeFn;
 use crate::{vm_debug, vm_trace};
 
 impl Vm {
-    fn pack_sync_native_call_args(&mut self, receiver: JsValue, callee: JsValue, args: &[JsValue]) -> Vec<u8> {
+    fn pack_sync_native_call_args(
+        &mut self, receiver: JsValue, callee: JsValue, args: &[JsValue],
+    ) -> SmallVec<[u8; 256]> {
         self.regs[253] = receiver;
         self.regs[254] = callee;
 
-        let mut arg_regs = Vec::with_capacity(args.len() + 1);
+        // 实参寄存器号列表容量恒 ≤ 254（253 实参 + receiver），栈内缓冲免每次 native 调用堆分配。
+        let mut arg_regs = SmallVec::new();
         arg_regs.push(253);
         for (idx, arg) in args.iter().enumerate() {
             let reg = (Self::SYNC_NATIVE_ARG_BASE + idx) as u8;
