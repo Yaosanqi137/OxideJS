@@ -39,9 +39,10 @@ pub fn is_int_literal(value: f64) -> bool {
     value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64
 }
 
-/// 判断表达式是否无副作用（字面量/标识符/纯二元运算等）。
-/// 用于可丢弃值的优化路径。
-/// 逻辑运算符快速路径的"无副作用"判定：仅字面量/标识符/this 读取安全。
+/// 判断表达式是否无副作用：仅字面量/this/RegExp 读取安全。
+/// 逻辑运算符快速路径的"无副作用"判定：左右两侧均安全时右值可急切发射
+/// （三操作数 AND/OR/NULLISH 指令）。标识符读可能抛 ReferenceError（未声明名/
+/// TDZ），不得判为无副作用，否则左值 falsy 时右值被求值破坏短路。
 /// 算术表达式（`1 / a` 等）不得判为无副作用——对象操作数强转（ToNumber 触发
 /// valueOf/toString/getter）可能在运行期抛错，急切求值会破坏 `||`/`&&` 短路。
 pub fn is_side_effect_free(expr: &Expression) -> bool {
@@ -52,7 +53,6 @@ pub fn is_side_effect_free(expr: &Expression) -> bool {
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
-            | Expression::Identifier(_)
             | Expression::RegExpLiteral(_)
             | Expression::ThisExpression(_) => {}
             Expression::ParenthesizedExpression(p) => stack.push(&p.expression),
