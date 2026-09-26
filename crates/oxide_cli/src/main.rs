@@ -286,7 +286,8 @@ fn format_object(
 fn format_array(
     vm: &oxide_vm::vm::Vm, string_forge: &PermInterner, shape_forge: &ShapeForge, obj: &JsObject,
 ) -> String {
-    let len = obj.prop_vec_len();
+    // 数组元素在独立元素区，命名属性区长度恒 0；元素区未分配时 get_prop_at 自然返回 undefined。
+    let len = obj.array_prop_count as usize;
     let mut items = Vec::new();
     for i in 0..len {
         let val = obj.get_prop_at(i);

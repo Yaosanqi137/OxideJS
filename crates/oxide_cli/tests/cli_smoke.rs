@@ -52,6 +52,18 @@ fn run_throw_script() {
 }
 
 #[test]
+fn eval_array_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_oxide"))
+        .args(["eval", "var a = [1, 2, 3]; a"])
+        .output()
+        .expect("failed to run oxide eval array");
+
+    assert!(output.status.success(), "eval array should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.trim() == "[1, 2, 3]", "eval 数组应打印元素区内容: {stdout}");
+}
+
+#[test]
 fn bench_help() {
     let output = Command::new(env!("CARGO_BIN_EXE_oxide"))
         .args(["bench", "--help"])
