@@ -14,8 +14,8 @@
 //! `JsObject` / `ShapeId` / `MAX_DENSE_PROPS`），显式名单防 `pub` 面无声扩大。
 //!
 //! 布局说明块位于 `JsObject` 定义上方（随结构体，不在模块头文档）；
-//! 尺寸守护为 `object_size_bounds` 测试的 256B 上界，与布局块字段总字节数
-//! 并存、不统一。
+//! 尺寸守护为 `js_object_exact_size` 测试的精确字节钉，与 `object_size_bounds`
+//! 的 256B 上界并存。
 
 use crate::value::JsValue;
 
@@ -75,18 +75,19 @@ pub const MAX_DENSE_PROPS: usize = 1_000_000;
 ///   generation: u32 (4 字节)
 ///   array_prop_count: u32 (4 字节，数组元素数，普通对象恒 0)
 ///   array_len_override: u32 (4 字节，逻辑长度覆盖，length 超 dense 上限时非 0)
-///   native_fn: Option\<NativeFnPtr\> (16 字节 — 裸 `*const ()` 无法利用 Option\<NonNull\>
-///              优化；因 repr(Rust) 布局规则存为包装 8 字节指针的 Option，带 8 字节
-///              判别式填充)
+///   native_fn: Option\<NativeFnPtr\> (8 字节 — NativeFnPtr 是 NonNull 指针，
+///              Option 借 null niche 缩为单指针)
 ///   sub_module_index: u32 (4 字节，子模块平表下标，与 table_gen 配对解析)
 ///   table_gen: u32 (4 字节，创建期所属子模块平表的表代际)
 ///   captured_this: JsValue (8 字节，箭头函数的词法 this)
 ///   home_object: JsValue (8 字节，\[\[HomeObject\]\]，供 super 查找)
 ///   boxed_value: JsValue (8 字节，装箱对象的被包基元载荷，见字段注释)
+///   regexp_source: JsValue (8 字节，RegExp 实例的 source 字符串)
+///   regexp_flags: JsValue (8 字节，RegExp 实例的 flags 字符串)
 ///   upvalues: *mut u8 (8 字节，指向闭包的 Box<Vec<*mut Cell>>)
 ///
-///   字段自和：124 字节，另有 4 字节对齐填充（native_fn 之前）
-///   总计：128 字节
+///   字段自和：132 字节，另有 4 字节尾部对齐填充
+///   总计：136 字节
 ///   对齐：8 字节
 pub struct JsObject {
     header: u32,

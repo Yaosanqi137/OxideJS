@@ -1,14 +1,16 @@
 //! 原生函数指针的类型安全不透明包装。
 //!
-//! 以 `*const ()` 存储而非具体 `fn` 类型，使本 crate 无需依赖 `oxide_vm`；
+//! 以 `NonNull<()>` 存储而非具体 `fn` 类型，使本 crate 无需依赖 `oxide_vm`；
 //! 指针必须由合法的 `NativeFn` 函数项创建且永不为空，`Send + Sync` 依赖
 //! 函数项指针天然线程安全。
 
+use std::ptr::NonNull;
+
 /// 原生函数指针的类型安全不透明包装。
 ///
-/// 以 `*const ()` 存储而非具体 `fn` 类型，使 `oxide_types` 无需依赖
-/// `oxide_vm::Vm`。`oxide_vm` 中的调用方经 `NativeFnPtr::call_with` 转回
-/// `NativeFn`——transmute 被限制在单个泛型辅助函数中。
+/// 以 `NonNull<()>` 存储而非具体 `fn` 类型，使 `oxide_types` 无需依赖
+/// `oxide_vm::Vm`。`oxide_vm` 中的调用方经 `native_fn_ptr_to_fn` 转回
+/// `NativeFn`——transmute 被限制在单个辅助函数中。
 ///
 /// # Safety 不变量
 ///
@@ -17,7 +19,7 @@
 /// 函数项指针天然线程安全（不含数据）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct NativeFnPtr(pub *const ());
+pub struct NativeFnPtr(pub NonNull<()>);
 
 impl NativeFnPtr {
     /// 包装裸函数指针。指针必须指向合法的 `NativeFn` 函数项。
@@ -28,13 +30,15 @@ impl NativeFnPtr {
     #[inline(always)]
     pub unsafe fn from_raw(ptr: *const ()) -> Self {
         debug_assert!(!ptr.is_null(), "NativeFnPtr must not be null");
-        Self(ptr)
+        // SAFETY: 非空性由调用方契约保证，debug 断言兜底；const→mut 仅为
+        // NonNull 构造所需的类型形态，不改变所指。
+        Self(unsafe { NonNull::new_unchecked(ptr as *mut ()) })
     }
 
     /// 返回底层裸指针。
     #[inline(always)]
     pub fn as_ptr(self) -> *const () {
-        self.0
+        self.0.as_ptr()
     }
 }
 
