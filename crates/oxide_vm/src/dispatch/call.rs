@@ -384,34 +384,48 @@ impl Vm {
     /// 读取当前闭包的 upvalue：命中 cell 判初始化后取值，未命中委托惰性建 cell。
     ///
     /// # 步骤
-    /// 1. 取 imm16 为 upvalue 下标，从当前 callee 的 `upvalues` 命中 cell。
+    /// 1. 取 imm16 为 upvalue 下标；缓存命中（键 = 当前 callee 位级相等）直接
+    ///    解引用缓存切片指针，未命中从 callee 重算并填缓存。
     /// 2. 命中且非空：未初始化（TDZ）抛 ReferenceError，否则值写入 `regs[rd]`。
     /// 3. 未命中/空槽（`CREATE_CLOSURE` 早于 `MAKE_CELL`）：委托
     ///    `lazy_create_upvalue_cell` 建 cell。
     ///
     /// # 边界与前提
     /// - `uv_idx` 越界或当前无 callee 时同样走惰性路径，最终回退 undefined。
-    ///
-    /// # 注意事项
-    /// - 手写 IR 保留指令（同 `dispatch_make_cell`）。
-    #[allow(dead_code)]
+    /// - 缓存指针在键匹配期间恒有效：callee 对象是 GC 根，`upvalues` Box
+    ///   创建后不替换。
     pub(crate) fn dispatch_load_upvalue(&mut self, rd: usize, instr: u32) -> Result<(), String> {
         let uv_idx = opcode::imm16(instr) as usize;
-        if let Some(callee) = self.current_callee() {
-            if callee.is_object() {
-                let obj = unsafe { &*callee.as_js_object_ptr() };
-                let upvals = obj.upvalues_slice();
-                if uv_idx < upvals.len() {
-                    let cell = upvals[uv_idx];
-                    if !cell.is_null() {
-                        let c = unsafe { &*cell };
-                        if !c.is_initialized() {
-                            return self
-                                .raise_error_kind("ReferenceError", "Cannot access variable before initialization");
-                        }
-                        self.regs[rd] = c.value;
-                        return Ok(());
+        let callee = self.current_callee();
+        // 命中：键位级相等保证缓存切片指针对应当前 callee 对象（对象为 GC 根、
+        // Box 创建后不替换），直接解引用安全。
+        let mut upvals: Option<&[*mut Cell]> = None;
+        if let Some((key, ptr)) = self.upvalue_cache {
+            if callee == Some(key) {
+                upvals = Some(unsafe { &*ptr });
+            }
+        }
+        // 未命中：重算切片指针并填缓存（含空切片，免每次 null 判定）。
+        if upvals.is_none() {
+            if let Some(callee) = callee {
+                if callee.is_object() {
+                    let obj = unsafe { &*callee.as_js_object_ptr() };
+                    let slice = obj.upvalues_slice();
+                    self.upvalue_cache = Some((callee, slice as *const [*mut Cell]));
+                    upvals = Some(slice);
+                }
+            }
+        }
+        if let Some(upvals) = upvals {
+            if uv_idx < upvals.len() {
+                let cell = upvals[uv_idx];
+                if !cell.is_null() {
+                    let c = unsafe { &*cell };
+                    if !c.is_initialized() {
+                        return self.raise_error_kind("ReferenceError", "Cannot access variable before initialization");
                     }
+                    self.regs[rd] = c.value;
+                    return Ok(());
                 }
             }
         }

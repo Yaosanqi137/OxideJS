@@ -317,6 +317,8 @@ impl Vm {
             strict: sub_is_strict,
             continuation,
         });
+        // 压帧后 callee 换为被调函数：失效 upvalue 切片缓存。
+        self.upvalue_cache = None;
 
         self.pc = 0;
         self.bytecode = sub_bytecode;

@@ -80,6 +80,9 @@ impl SuspendedFrame {
     pub fn save_from(&mut self, vm: &mut Vm, callee: JsValue) -> Result<(), String> {
         let frame = vm.frames.pop().ok_or_else(|| "frame missing on suspend".to_string())?;
         self.frame = Some(frame);
+        // 挂起弹帧不经 restore_frame：失效 upvalue 切片缓存（值相等键已自愈，
+        // 此为双保险）。
+        vm.upvalue_cache = None;
         *self.regs = vm.regs;
         self.pc = vm.pc;
         self.bytecode = std::mem::take(&mut vm.bytecode);

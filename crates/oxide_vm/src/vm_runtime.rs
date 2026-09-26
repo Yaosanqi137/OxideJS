@@ -101,6 +101,9 @@ macro_rules! inline_save_field {
     ($recv:ident, $window_regs:ident, inline_callee, opt_copy) => {
         $recv.inline_callee
     };
+    ($recv:ident, $window_regs:ident, upvalue_cache, copy) => {
+        $recv.upvalue_cache
+    };
     ($recv:ident, $window_regs:ident, generator_dispatch, flag_zero) => {{
         let prev = $recv.generator_dispatch;
         $recv.generator_dispatch = false;
@@ -208,6 +211,9 @@ macro_rules! inline_restore_field {
     ($recv:ident, $saved:ident, inline_callee, opt_copy) => {
         $recv.inline_callee = $saved.inline_callee
     };
+    ($recv:ident, $saved:ident, upvalue_cache, copy) => {
+        $recv.upvalue_cache = $saved.upvalue_cache
+    };
     ($recv:ident, $saved:ident, generator_dispatch, flag_zero) => {
         $recv.generator_dispatch = $saved.generator_dispatch
     };
@@ -271,6 +277,7 @@ macro_rules! inline_core_fields {
             (spill_stack, move_field),            // V M
             (cell_stack, move_field),             // V M
             (inline_callee, opt_copy),            // V M
+            (upvalue_cache, copy),                // V
             (generator_dispatch, flag_zero),      // M 调度标志：快照属主值，嵌套期间清零
             (async_dispatch, flag_zero),          // M 调度标志：快照属主值，嵌套期间清零
             (construct_dispatch, flag_zero),      // M 调度标志：快照属主值，嵌套期间清零
@@ -523,6 +530,8 @@ impl Vm {
             frame.return_addr,
             frame.caller_reg_limit
         );
+        // 弹帧后 callee 换回调用方：失效 upvalue 切片缓存。
+        self.upvalue_cache = None;
         if let Some(saved_bc) = self.saved_bytecode_stack.pop() {
             self.bytecode = saved_bc;
         }
