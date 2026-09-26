@@ -416,13 +416,14 @@ fn promise_result_string_survives_runtime_gc() {
          0",
     );
     vm.run(&Arc::new(first)).expect("run1");
+    // 统计按 run 复位：churn 在 run1 内，断言须在 run1 后读。
+    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期字符串 GC");
 
     let second = compile("globalThis.got");
     let result = vm.run(&Arc::new(second)).expect("run2");
     let text = vm.lookup_str(result).expect("got 应为字符串").to_string();
 
     assert_eq!(text, "prombox".repeat(8));
-    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期字符串 GC");
 }
 
 /// 盒持唯一引用 session BigInt（Promise 结算值，运行时乘积非常量池字面量）：
@@ -440,6 +441,8 @@ fn promise_result_bigint_survives_runtime_gc() {
          0",
     );
     vm.run(&Arc::new(first)).expect("run1");
+    // 统计按 run 复位：churn 在 run1 内，断言须在 run1 后读。
+    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期 GC");
 
     let second = compile("globalThis.got");
     let result = vm.run(&Arc::new(second)).expect("run2");
@@ -447,7 +450,6 @@ fn promise_result_bigint_survives_runtime_gc() {
     let expected = num_bigint::BigInt::from(987654321u64) * num_bigint::BigInt::from(123456789u64);
     assert!(result.is_bigint(), "got 应为 BigInt");
     assert_eq!(vm.bigint_value(result), &expected);
-    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期 GC");
 }
 
 /// 挂起生成器帧寄存器持唯一引用 session BigInt：yield 挂起后仅状态盒
@@ -485,6 +487,8 @@ fn suspended_async_function_bigint_survives_runtime_gc() {
          0",
     );
     vm.run(&Arc::new(first)).expect("run1");
+    // 统计按 run 复位：churn 在 run1 内，断言须在 run1 后读。
+    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期 GC");
 
     let second = compile("globalThis.got");
     let result = vm.run(&Arc::new(second)).expect("run2");
@@ -492,7 +496,6 @@ fn suspended_async_function_bigint_survives_runtime_gc() {
     let expected = num_bigint::BigInt::from(987654321u64) * num_bigint::BigInt::from(123456789u64);
     assert!(result.is_bigint(), "got 应为 BigInt");
     assert_eq!(vm.bigint_value(result), &expected);
-    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期 GC");
 }
 
 /// 挂起异步生成器帧持唯一引用 session BigInt：首次 next 挂起后仅状态盒
@@ -511,6 +514,8 @@ fn suspended_async_generator_bigint_survives_runtime_gc() {
          run().then(function(v){ globalThis.got = v; })",
     );
     vm.run(&Arc::new(first)).expect("run1");
+    // 统计按 run 复位：churn 在 run1 内，断言须在 run1 后读。
+    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期 GC");
 
     let second = compile("globalThis.got");
     let result = vm.run(&Arc::new(second)).expect("run2");
@@ -518,7 +523,6 @@ fn suspended_async_generator_bigint_survives_runtime_gc() {
     let expected = num_bigint::BigInt::from(987654321u64) * num_bigint::BigInt::from(123456789u64);
     assert!(result.is_bigint(), "got 应为 BigInt");
     assert_eq!(vm.bigint_value(result), &expected);
-    assert!(vm.session_gc_stats().total_collections > 0, "churn 应触发执行期 GC");
 }
 
 /// 盒持唯一引用 session 串（Map 值）：churn 窗口内收集经盒边闭合存活，

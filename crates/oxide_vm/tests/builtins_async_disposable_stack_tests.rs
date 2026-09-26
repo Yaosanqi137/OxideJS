@@ -490,13 +490,14 @@ fn gc_runtime_collection_keeps_entries() {
     .expect("parse");
     let module = Compiler::new().compile(&program).expect("compile");
     vm.run(&Arc::new(module)).expect("run1");
+    // 统计按 run 复位：churn 在 run1 内，断言须在 run1 后读。
+    assert!(vm.session_gc_stats().total_collections > 0, "低阈值应触发执行期 GC");
     let allocator = Allocator::default();
     let program2 = oxide_parser::parse(&allocator, "globalThis.log.length + ''").expect("parse");
     let module2 = Compiler::new().compile(&program2).expect("compile");
     let result = vm.run(&Arc::new(module2)).expect("run2");
     let text = vm.lookup_str(result).unwrap_or_default().to_string();
     assert_eq!(text, "200");
-    assert!(vm.session_gc_stats().total_collections > 0, "低阈值应触发执行期 GC");
 }
 
 /// promote 交叉：栈的 entries 引用 epoch 对象（释放函数），写 global 触发 promote，

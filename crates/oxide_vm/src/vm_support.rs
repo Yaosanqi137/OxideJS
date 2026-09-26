@@ -558,6 +558,21 @@ impl Vm {
         // per-run 指标（ic_hit_rate）跨文件累积，报告失真。
         self.profiling.ic_hits.set(0);
         self.profiling.ic_misses.set(0);
+        // GC 统计同属执行期状态：池化 Vm 跨 run 复用，不清零则 per-run
+        // 指标（gc_trigger_count）跨文件累积，报告失真。
+        let gc = &mut self.gc_state.session_gc;
+        gc.total_collections = 0;
+        gc.total_bytes_freed = 0;
+        gc.total_objects_scanned = 0;
+        gc.total_objects_live = 0;
+        gc.total_objects_dead = 0;
+        gc.last_collection_objects_scanned = 0;
+        gc.last_collection_objects_live = 0;
+        gc.last_collection_objects_dead = 0;
+        gc.last_collection_bytes_freed = 0;
+        gc.last_collection_duration_us = 0;
+        gc.max_collection_duration_us = 0;
+        gc.min_collection_duration_us = u64::MAX;
     }
 
     /// 轻量重置：清空执行状态并回收 epoch 内存，但保留 session 字符串与 builtin。

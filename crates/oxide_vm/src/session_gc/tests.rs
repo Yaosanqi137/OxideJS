@@ -1607,6 +1607,7 @@ fn in_run_collection_keeps_live_addresses_stable() {
 
     // 第一轮执行期收集：o 及其 epoch 子引用晋升 session。
     vm.maybe_collect_in_run();
+    assert!(vm.session_gc_stats().total_collections >= 1, "第一轮收集应执行");
     let o = global_prop_opt(&vm, "o").expect("o 应挂在 global");
     let o_ptr = o.as_js_object_ptr();
     assert!(unsafe { (*o_ptr).is_session_epoch() }, "o 晋升后应为 session 对象");
@@ -1627,8 +1628,11 @@ fn in_run_collection_keeps_live_addresses_stable() {
     .expect("run2");
     // run 边界清空执行状态：churn 局部（t 数组与 50 个对象）自此不可达。
     vm.run(&Arc::new(compile("0"))).expect("run3");
+    // 统计按 run 复位：run 边界后只认第二轮计数，记录前值作增量基准。
+    let before = vm.session_gc_stats().total_collections;
     vm.maybe_collect_in_run();
-    assert!(vm.session_gc_stats().total_collections >= 2, "两轮收集均应执行");
+    assert!(vm.session_gc_stats().total_collections >= 1, "第二轮收集应执行");
+    assert!(vm.session_gc_stats().total_collections > before, "两轮收集均应执行");
 
     assert_eq!(global_prop_opt(&vm, "o").expect("o").as_js_object_ptr(), o_ptr, "存活对象地址不变");
     assert_eq!(
