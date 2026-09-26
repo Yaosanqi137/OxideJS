@@ -560,10 +560,13 @@ impl BuiltinWorld {
         let async_disposable_stack_proto = P::new(JsObject::new_empty(EMPTY_SHAPE_ID, JsValue::null()));
         // 默认迭代器指针初值空（绑定层随后经 bind_string 捕获写入）。
         let string_default_iterator = std::cell::Cell::new(std::ptr::null());
+        // %ThrowTypeError% 指针初值空（绑定层随后经 bind_function 捕获写入）。
+        let throw_type_error = std::cell::Cell::new(std::ptr::null());
 
         let world = Self {
             object_proto,
             string_default_iterator,
+            throw_type_error,
             array_proto,
             function_proto,
             string_proto,

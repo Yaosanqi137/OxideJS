@@ -494,6 +494,13 @@ impl BuiltinWorld {
             } else {
                 current.string_default_iterator.get()
             }),
+            // %ThrowTypeError% 原型链挂 Function.prototype：function 家族脏时
+            // 置空由绑定层重建，未脏沿用旧对象（跨重建恒等）。
+            throw_type_error: std::cell::Cell::new(if dirty.function {
+                std::ptr::null()
+            } else {
+                current.throw_type_error.get()
+            }),
             array_proto,
             function_proto,
             string_proto,

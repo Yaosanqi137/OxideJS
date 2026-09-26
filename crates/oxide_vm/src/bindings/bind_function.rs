@@ -66,8 +66,14 @@ pub fn bind_function(core: &Arc<KernelCore>, session: &KernelSession, global: &m
 }
 
 /// 在 Function.prototype 上绑定 caller/arguments 受限访问器：两属性的
-/// get/set 共用同一 %ThrowTypeError% 函数对象（name="get caller"、length=0），
-/// 描述符 { enumerable:false, configurable:true }。
+/// get/set 共用同一 %ThrowTypeError% 函数对象（匿名、length=0、冻结、
+/// 不可扩展），描述符 { enumerable:false, configurable:true }。
+///
+/// # 步骤
+/// 1. 取共享 %ThrowTypeError% 对象：选择性重建复用（同键旧对象迁移），
+///    未命中时新建（length 先于 name、描述符三标志全 false）。
+/// 2. 对象指针写入 world Cell（运行期创建 arguments 对象时读取，跨形态恒等）。
+/// 3. 为 caller/arguments 各开 shape 槽位并写入访问器 meta。
 ///
 /// # 副作用
 /// - 为 caller/arguments 各开 shape 槽位并写入访问器 meta；thrower 函数对象
@@ -81,14 +87,13 @@ fn bind_function_proto_restricted(core: &Arc<KernelCore>, session: &KernelSessio
     let si_length = string_forge.intern("length").0;
     let si_caller = string_forge.intern("caller").0;
     let si_arguments = string_forge.intern("arguments").0;
-    let si_label = string_forge.intern("get caller").0;
+    let si_label = string_forge.intern("ThrowTypeError").0;
 
-    // 构造单一 thrower 函数对象，供两属性 get/set 共用（选择性重建复用：
-    // 同家族同槽旧 thrower 迁移到新 proto 的访问器槽，不再新建对象）。
+    // 取共享 %ThrowTypeError% 对象，供两属性 get/set 与 unmapped arguments.callee
+    // 访问器共用（选择性重建复用：同键旧对象迁移，不新建，跨形态恒等）。
     // SAFETY: thrower 函数项指针转为 *const ()。
-    let thrower_fn_ptr = unsafe {
-        NativeFnPtr::from_raw(oxide_builtins::function::function_restricted_thrower::<crate::vm::Vm> as *const ())
-    };
+    let thrower_fn_ptr =
+        unsafe { NativeFnPtr::from_raw(oxide_builtins::function::throw_type_error::<crate::vm::Vm> as *const ()) };
     let reuse_key = FnWrapperKey::new(family, si_label, si_caller, si_name);
     let thrower_ptr = match world.find_fn_wrapper(reuse_key, thrower_fn_ptr, 0) {
         Some(ptr) => ptr,
@@ -98,23 +103,29 @@ fn bind_function_proto_restricted(core: &Arc<KernelCore>, session: &KernelSessio
             thrower.set_function(true);
             thrower.set_native_fn(Some(thrower_fn_ptr));
             thrower.set_native_arg_count(0);
-            let name_shape = shape_forge.make_shape(thrower.shape_id(), si_name);
-            thrower.set_shape_id(name_shape);
-            thrower
-                .ensure_hash_props()
-                .push(JsValue::perm_string(string_forge.string_ptr(si_label)));
-            let name_pos = thrower.hash_props_vec().map_or(0, |v| v.len() as u32).saturating_sub(1);
-            thrower.set_data_meta(name_pos, PropAttributes::new(false, false, true));
+            // length 先于 name（ownNames 序 ["length","name"]），描述符
+            // { writable:false, enumerable:false, configurable:false }。
             let length_shape = shape_forge.make_shape(thrower.shape_id(), si_length);
             thrower.set_shape_id(length_shape);
             thrower.ensure_hash_props().push(JsValue::int(0));
             let length_pos = thrower.hash_props_vec().map_or(0, |v| v.len() as u32).saturating_sub(1);
-            thrower.set_data_meta(length_pos, PropAttributes::new(false, false, true));
+            thrower.set_data_meta(length_pos, PropAttributes::new(false, false, false));
+            let name_shape = shape_forge.make_shape(thrower.shape_id(), si_name);
+            thrower.set_shape_id(name_shape);
+            thrower
+                .ensure_hash_props()
+                .push(JsValue::perm_string(string_forge.string_ptr(string_forge.intern("").0)));
+            let name_pos = thrower.hash_props_vec().map_or(0, |v| v.len() as u32).saturating_sub(1);
+            thrower.set_data_meta(name_pos, PropAttributes::new(false, false, false));
+            thrower.set_extensible(false);
+            thrower.set_frozen(true);
             let ptr = Box::into_raw(thrower);
             world.track_fn_wrapper(ptr, reuse_key);
             ptr
         }
     };
+    // 指针写入 world Cell：运行期创建 arguments 对象时读取，保证跨形态恒等。
+    world.throw_type_error.set(thrower_ptr);
     let thrower_val = JsValue::from_js_object(thrower_ptr);
     let attrs = PropAttributes::new(false, false, true);
     for key in [si_caller, si_arguments] {

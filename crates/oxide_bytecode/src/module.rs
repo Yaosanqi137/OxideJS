@@ -68,6 +68,9 @@ pub struct CompiledModule {
     pub function_name: Option<String>,
     /// 函数 `length` 属性值：第一个带默认值/解构默认的形参之前的形参数（rest 不计）。
     pub function_length: u32,
+    /// 形参列表是否 simple（全部无初始值标识符且无 rest）：arguments 对象
+    /// callee 形态（数据属性 vs 受限访问器）按 strict ‖ !simple 分流。
+    pub has_simple_params: bool,
     /// 是否为类构造函数（普通 CALL 必须拒绝它，仅 NEW_EXPRESSION 可经它构造）。
     pub is_class_constructor: bool,
     /// 类构造函数是否有 `extends` 子句（`this` 在 SUPER_CALL 完成前保持未初始化）。
@@ -104,6 +107,7 @@ impl CompiledModule {
             captured_this_const_idx: 0,
             function_name: None,
             function_length: 0,
+            has_simple_params: false,
             is_class_constructor: false,
             is_derived_constructor: false,
             needs_home_object: false,
@@ -138,6 +142,7 @@ impl Clone for CompiledModule {
             captured_this_const_idx: self.captured_this_const_idx,
             function_name: self.function_name.clone(),
             function_length: self.function_length,
+            has_simple_params: self.has_simple_params,
             is_class_constructor: self.is_class_constructor,
             is_derived_constructor: self.is_derived_constructor,
             needs_home_object: self.needs_home_object,

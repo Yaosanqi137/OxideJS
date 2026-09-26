@@ -270,25 +270,16 @@ pub fn function_bind<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         (*wrapper).set_native_arg_count(bound_arg_count as u8);
     }
 
-    // length/name/caller/arguments 先定义占 shape 槽位 0..3（length/name 数据 +
-    // caller/arguments 访问器占位）；绑定状态随后以独立状态对象存为第 4 号 shape
-    // 属性（保留键），不与用户 own 属性共享下标空间。
+    // length/name 先定义占 shape 槽位 0..1；绑定状态随后以独立状态对象存为
+    // 第 2 号 shape 属性（保留键），不与用户 own 属性共享下标空间。bound 函数
+    // 无 own caller/arguments（BoundFunctionCreate 语义），经原型链继承 FP
+    // 受限访问器，访问即抛 TypeError。
     let length_si = vm.kernel_core().perm_interner().intern("length").0;
     let name_si = vm.kernel_core().perm_interner().intern("name").0;
-    let caller_si = vm.kernel_core().perm_interner().intern("caller").0;
-    let arguments_si = vm.kernel_core().perm_interner().intern("arguments").0;
     let attrs = PropAttributes::new(false, false, true);
 
-    // bound 函数的 caller/arguments 是受限访问器：读写一律抛 TypeError（poisoned）。
-    let thrower = vm.alloc_object(JsObject::new_empty(EMPTY_SHAPE_ID, fn_proto_val));
-    unsafe {
-        (*thrower).set_function(true);
-        (*thrower).set_native_fn(Some(NativeFnPtr::from_raw(bound_restricted_thrower::<H> as *const ())));
-    }
-    let thrower_val = JsValue::from_js_object(thrower);
-
-    // 全部 shape 属性（length/name/caller/arguments）须先于状态数据定义完成，
-    // 保证 shape 槽位与 dense 下标对齐，再 push [target, thisArg, ...boundArgs]。
+    // 全部 shape 属性（length/name）须先于状态数据定义完成，保证 shape 槽位
+    // 与 dense 下标对齐，再 push [target, thisArg, ...boundArgs]。
     unsafe {
         let wrapper_ref = &mut *wrapper;
         let target_obj = &*target_val.as_js_object_ptr();
@@ -319,17 +310,11 @@ pub fn function_bind<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         if let Err(e) = vm.define_data_property(wrapper_ref, name_si, name_val, attrs) {
             return NativeResult::Err(crate::error::create_type_error(vm, &e));
         }
-        if let Err(e) = vm.define_accessor_property(wrapper_ref, caller_si, thrower_val, thrower_val, attrs) {
-            return NativeResult::Err(crate::error::create_type_error(vm, &e));
-        }
-        if let Err(e) = vm.define_accessor_property(wrapper_ref, arguments_si, thrower_val, thrower_val, attrs) {
-            return NativeResult::Err(crate::error::create_type_error(vm, &e));
-        }
     }
     // 绑定状态（[target, thisArg, ...boundArgs]）存独立状态对象：命名属性存储与
-    // shape 槽位共享下标，状态值若直接裸推包装器存储槽 4+，用户新增 own 属性时
+    // shape 槽位共享下标，状态值若直接裸推包装器存储槽 2+，用户新增 own 属性时
     // shape 槽位与存储下标错位（读写互串）。状态对象内部存储不占 shape 槽位，
-    // 经保留键作为包装器固定第 4 号 shape 属性暴露，用户代码不可见。
+    // 经保留键作为包装器固定第 2 号 shape 属性暴露，用户代码不可见。
     let object_proto = vm.session().builtin_world().object_proto.as_ptr() as *mut JsObject;
     let state = vm.alloc_object(JsObject::new_empty(EMPTY_SHAPE_ID, JsValue::from_js_object(object_proto)));
     unsafe {
@@ -348,41 +333,25 @@ pub fn function_bind<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     NativeResult::Ok(JsValue::from_js_object(wrapper))
 }
 
-/// 读 bound 包装器固定第 4 号 shape 属性处的状态对象，返回其存储
+/// 读 bound 包装器固定第 2 号 shape 属性处的状态对象，返回其存储
 /// [target, thisArg, ...boundArgs]（缺位时返回空 vec）。
 pub fn bound_state_values(wrapper: &JsObject) -> Vec<JsValue> {
     wrapper
         .hash_props_vec()
-        .and_then(|props| props.get(4).copied())
+        .and_then(|props| props.get(2).copied())
         .filter(|v| v.is_object() && !v.as_js_object_ptr().is_null())
         .and_then(|sv| unsafe { &*sv.as_js_object_ptr() }.hash_props_vec().cloned())
         .unwrap_or_default()
 }
 
-/// bound 函数 caller/arguments 的受限访问器：任何访问（get/set）都抛 TypeError。
-fn bound_restricted_thrower<H: VmHost>(vm: &mut H, _args: &[u8]) -> NativeResult {
+/// %ThrowTypeError%：受限属性访问器（Function.prototype 的 caller/arguments、
+/// unmapped arguments.callee）共用的内置函数，任何调用恒抛 TypeError。
+pub fn throw_type_error<H: VmHost>(vm: &mut H, _args: &[u8]) -> NativeResult {
     NativeResult::Err(crate::error::create_type_error(
         vm,
-        "'caller' and 'arguments' are restricted on bound functions",
+        "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode \
+         functions or the arguments objects for calls to them",
     ))
-}
-
-/// %ThrowTypeError%：Function.prototype 的 caller/arguments 受限访问器共用。
-///
-/// 按接收者受限性分流：严格函数对象与生成器 / 异步 / 异步生成器函数对象
-/// 的 get/set 一律抛 TypeError；非严格普通函数对象读不抛、返回 undefined
-/// （写不抛、丢弃写入），与规范"非严格函数 caller 可读"的残面一致。
-pub fn function_restricted_thrower<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
-    let this_val = vm.reg(if args.is_empty() { 0 } else { args[0] });
-    let obj = match vm.checked_object_ptr(this_val, "restricted property access") {
-        Ok(Some(obj)) => obj,
-        Ok(None) => return NativeResult::Err(crate::error::create_type_error(vm, "restricted property access")),
-        Err(e) => return NativeResult::Err(crate::error::create_type_error(vm, &e)),
-    };
-    if !vm.function_is_restricted(unsafe { &*obj }) {
-        return NativeResult::Ok(JsValue::undefined());
-    }
-    NativeResult::Err(crate::error::create_type_error(vm, "restricted property access"))
 }
 
 /// `Function.prototype.toString`：返回 `function name() { [native code] }`

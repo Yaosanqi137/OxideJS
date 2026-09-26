@@ -61,6 +61,9 @@ pub struct IRFunction {
     pub function_name: Option<String>,
     /// 函数 `length` 属性值：第一个带默认值/解构默认的形参之前的形参数（rest 不计）。
     pub function_length: u32,
+    /// 形参列表是否 simple（全部无初始值标识符且无 rest）：arguments 对象
+    /// callee 形态（数据属性 vs 受限访问器）按 strict ‖ !simple 分流。
+    pub has_simple_params: bool,
     /// 本函数是否为顶层脚本函数：顶层 STORE_VAR 写全局可观察状态，不可被精确 DCE
     /// 删除；函数内局部 STORE_VAR 才可删。emit 在 assemble_ir 处由
     /// `parent_ctx.is_none()` 填充；nested/手工构造默认 false。
@@ -93,6 +96,7 @@ impl IRFunction {
             captured_this_const_idx: 0,
             function_name: None,
             function_length: 0,
+            has_simple_params: false,
             is_top_level: false,
             const_overflow: false,
             nested: Vec::new(),

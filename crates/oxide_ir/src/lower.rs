@@ -90,6 +90,7 @@ pub fn lower(f: &IRFunction) -> Result<CompiledModule, String> {
         captured_this_const_idx: f.captured_this_const_idx,
         function_name: f.function_name.clone(),
         function_length: f.function_length,
+        has_simple_params: f.has_simple_params,
         is_class_constructor: f.is_class_constructor,
         is_derived_constructor: f.is_derived_constructor,
         needs_home_object: f.needs_home_object,

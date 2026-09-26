@@ -319,6 +319,14 @@ impl Emitter {
             })
             .count() as u32;
 
+        // simple 参数列表：全部形参为无初始值标识符且无 rest（规范
+        // simpleParameterList）。arguments 对象 callee 形态（数据属性 vs
+        // 受限访问器）按 strict ‖ !simple 分流，length 口径不可代用
+        // （f({x}) 的 length 与 n_args 相等但非 simple）。
+        ctx.has_simple_params = param_specs
+            .iter()
+            .all(|spec| matches!(spec, ParamSpec::Identifier { initializer: None, .. }));
+
         // 继承父内置寄存器映射：子模块寄存器文件中，内置标识符（Math、Object 等）
         // 解析到父预先分配的槽位。
         ctx.scopes.builtin_reg_map = parent_ctx.scopes.builtin_reg_map.clone();

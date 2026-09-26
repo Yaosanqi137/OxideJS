@@ -132,6 +132,11 @@ pub struct BuiltinWorld {
     /// 同一对象），无法像集合迭代器那样复用"与迭代器原型槽比较"的判法，
     /// 故独立存一份指针。`Cell` 供绑定层经 `&Arc<BuiltinWorld>` 共享引用写入。
     pub string_default_iterator: std::cell::Cell<*const JsObject>,
+    /// `%ThrowTypeError%` 函数对象裸指针：Function.prototype 的 caller/arguments
+    /// 受限访问器与 unmapped arguments.callee 访问器共享同一对象（跨形态恒等）。
+    /// 绑定层安装访问器时写入，运行期创建 arguments 对象时读取；wrapper 本体归
+    /// `leaked_objects` 释放登记表所有，session 收尾统一释放。
+    pub throw_type_error: std::cell::Cell<*const JsObject>,
     /// `%RegExpStringIteratorPrototype%`：matchAll 返回的迭代器。
     pub regexp_string_iterator_proto: P<JsObject>,
     /// `%AsyncIteratorPrototype%`：异步迭代器原型（链到 Object.prototype），

@@ -120,6 +120,9 @@ pub struct CompileCtx {
     /// 函数 `length` 属性值：首个带默认值形参之前的形参数（rest 不计）。
     /// emit_params_prologue 前由编译入口从 param_specs 计算。
     pub(crate) function_length: u32,
+    /// 形参列表是否 simple（全部无初始值标识符且无 rest）：arguments 对象
+    /// callee 形态（数据属性 vs 受限访问器）按 strict ‖ !simple 分流。
+    pub(crate) has_simple_params: bool,
     pub(crate) const_overflow: bool,
     /// with 语句作用域栈：元素为 (with 对象寄存器, 打开时的作用域深度)。
     /// 非空时 with 体内的自由标识符需动态解析（先查对象属性，回退外层）。
@@ -250,6 +253,7 @@ impl CompileCtx {
             implicit_global_reads: HashSet::new(),
             implicit_global_writes: HashSet::new(),
             function_length: 0,
+            has_simple_params: false,
             const_overflow: false,
             with_stack: Vec::new(),
             open_try_handlers: Vec::new(),
@@ -819,6 +823,7 @@ impl CompileCtx {
             captured_this_const_idx: 0,
             function_name: None,
             function_length: self.function_length,
+            has_simple_params: self.has_simple_params,
             is_top_level: parent_ctx.is_none(),
             const_overflow: self.const_overflow,
             nested: std::mem::take(&mut self.nested),

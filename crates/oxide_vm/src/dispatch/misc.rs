@@ -265,13 +265,13 @@ impl Vm {
     }
 
     /// 创建 arguments 对象：索引属性取当前帧（或 inline 同步调用）的完整实参，
-    /// 附 length / callee / @@iterator 属性。第一版为 unmapped（非严格）语义，
-    /// 索引与形参不同步。
+    /// 附 length / callee / @@iterator 属性。索引与形参不同步（mapped 同步语义
+    /// 未实现）；callee 按 strict ‖ !simple 分流为受限访问器或数据属性。
     ///
     /// # 边界与前提
     /// - 实参区由统一压帧入口 `push_bytecode_frame` 在推帧时写入 spill 栈；
     ///   frames 为空（inline 同步调用）时读 `inline_args_*`。
-    /// - 索引属性用 shape 槽存储（普通对象），length/callee 为不可枚举数据属性。
+    /// - 索引属性用 shape 槽存储（普通对象），length 为不可枚举数据属性。
     pub(crate) fn dispatch_create_arguments(&mut self, rd: usize) -> Result<(), String> {
         let (base, count) = match self.frames.last() {
             Some(frame) => (frame.arguments_base, frame.arguments_count),
@@ -301,11 +301,64 @@ impl Vm {
             return self.raise_error_kind("TypeError", &msg);
         }
 
-        // callee：当前执行函数，可写、不可枚举、可配置（严格模式应抛 TypeError，未支持）。
+        // callee：按 strict 与 simple 参数列表四分流（规范 CreateMappedArgumentsObject /
+        // CreateUnmappedArgumentsObject）：strict ‖ !simple → 受限访问器（get/set
+        // 共享 %ThrowTypeError%，访问即抛）；sloppy simple → 数据属性（值 = 当前
+        // 函数本身，可写、不可枚举、可配置）。
         let callee_si = self.kernel_core.perm_interner().intern("callee").0;
         let callee = self.current_callee().unwrap_or(JsValue::undefined());
-        if let Err(msg) = self.define_data_property(obj, callee_si, callee, PropAttributes::new(true, false, true)) {
+        let strict = self.current_strict();
+        let simple = self.active_module().is_some_and(|m| m.has_simple_params);
+        if strict || !simple {
+            // SAFETY: 指针由绑定层在 session 构造期写入，session 存活期内有效。
+            let thrower_ptr = self.session.builtin_world().throw_type_error.get();
+            if thrower_ptr.is_null() {
+                // 绑定层尚未写入共享对象（正常路径不出现）：退化为数据属性保调用可用。
+                if let Err(msg) =
+                    self.define_data_property(obj, callee_si, callee, PropAttributes::new(true, false, true))
+                {
+                    return self.raise_error_kind("TypeError", &msg);
+                }
+            } else {
+                // SAFETY: thrower_ptr 由绑定层写入的存活对象，转 *mut 供 from_js_object 消费。
+                let thrower_val = JsValue::from_js_object(unsafe { &*thrower_ptr } as *const JsObject as *mut JsObject);
+                if let Err(msg) = self.define_accessor_property(
+                    obj,
+                    callee_si,
+                    thrower_val,
+                    thrower_val,
+                    PropAttributes::new(false, false, false),
+                ) {
+                    return self.raise_error_kind("TypeError", &msg);
+                }
+            }
+        } else if let Err(msg) =
+            self.define_data_property(obj, callee_si, callee, PropAttributes::new(true, false, true))
+        {
             return self.raise_error_kind("TypeError", &msg);
+        }
+
+        // sloppy 函数：own caller/arguments 数据属性（ES5 遗留，node 行为）——
+        // caller = 调用方函数（帧栈次顶帧 callee），arguments = 本对象。strict
+        // 函数无 own caller/arguments，经原型链解析到 FP 受限访问器（访问即抛）。
+        if !strict && callee.is_object() {
+            let caller = self
+                .frames
+                .get(self.frames.len().saturating_sub(2))
+                .map(|f| f.callee)
+                .unwrap_or(JsValue::undefined());
+            let callee_obj = unsafe { &mut *callee.as_js_object_ptr() };
+            let caller_si = self.kernel_core.perm_interner().intern("caller").0;
+            let arguments_si = self.kernel_core.perm_interner().intern("arguments").0;
+            let data_attrs = PropAttributes::new(true, false, true);
+            if let Err(msg) = self.define_data_property(callee_obj, caller_si, caller, data_attrs) {
+                return self.raise_error_kind("TypeError", &msg);
+            }
+            if let Err(msg) =
+                self.define_data_property(callee_obj, arguments_si, JsValue::from_js_object(obj_ptr), data_attrs)
+            {
+                return self.raise_error_kind("TypeError", &msg);
+            }
         }
 
         // @@iterator：与 Array.prototype[Symbol.iterator] 共享同一函数对象，
