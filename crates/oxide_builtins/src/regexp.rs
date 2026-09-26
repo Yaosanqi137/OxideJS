@@ -452,6 +452,35 @@ pub fn regexp_constructor<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         (Vec::<u16>::new(), Vec::<u16>::new())
     };
     let pattern = String::from_utf16_lossy(&pattern_units);
+    // RegExpInitialize step 5：未知旗与重旗均抛 SyntaxError（regress 的
+    // Flags::new 静默跳未知旗、重旗幂等吞，构造器侧须前置校验）。
+    let mut flag_seen = [false; 8];
+    for &unit in &flags_units {
+        let ch = char::from_u32(unit as u32).unwrap_or('\u{FFFD}');
+        let idx = match ch {
+            'd' => 0,
+            'g' => 1,
+            'i' => 2,
+            'm' => 3,
+            's' => 4,
+            'u' => 5,
+            'v' => 6,
+            'y' => 7,
+            _ => {
+                return NativeResult::Err(crate::error::create_syntax_error(
+                    vm,
+                    &format!("Invalid regular expression flags: '{ch}' is not a valid flag"),
+                ));
+            }
+        };
+        if flag_seen[idx] {
+            return NativeResult::Err(crate::error::create_syntax_error(
+                vm,
+                &format!("Invalid regular expression flags: '{ch}' is duplicated"),
+            ));
+        }
+        flag_seen[idx] = true;
+    }
     let flags = normalize_flags(&String::from_utf16_lossy(&flags_units));
     let flags_units = flags.encode_utf16().collect::<Vec<u16>>();
 
