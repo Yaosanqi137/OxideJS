@@ -999,22 +999,50 @@ pub fn regexp_get_unicode_sets<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResu
 }
 
 /// `RegExp.prototype.flags` getter：返回实例 flags 串。
+///
+/// 非对象 this 抛 TypeError；持编译正则槽的对象直接返槽串；其余对象
+/// （含 prototype 本身）无槽可返，按规范顺序读 8 个旗属性并以 ToBoolean
+/// 判位组串。
 pub fn regexp_get_flags<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let this_val = vm.reg(args[0]);
-    // proto 恒等判定：规范对 prototype 本身返回 undefined。
-    if this_val.is_object() {
+    if !this_val.is_object() {
+        return NativeResult::Err(crate::error::create_type_error(vm, "RegExp.prototype method called on non-object"));
+    }
+    let this_ptr = this_val.as_js_object_ptr();
+    if this_ptr.is_null() {
+        return NativeResult::Err(crate::error::create_type_error(vm, "null object"));
+    }
+    // 持编译正则槽的对象直接返槽串。
+    // SAFETY: this_ptr 已确认非空对象值，借用即时消费。
+    if unsafe { &*this_ptr }.is_regexp_obj() {
+        // SAFETY: 同上，槽串由对象持有。
+        return NativeResult::Ok(unsafe { &*this_ptr }.get_regexp_flags());
+    }
+    // 无槽对象：按规范序（d,g,i,m,s,u,v,y）读 8 个旗属性，ToBoolean 判位
+    // 组串。每次读都可能触发用户 getter 重入（session GC 可搬移对象），
+    // 对象指针须每次读前从 this 寄存器（GC 根）重取。
+    let mut out: Vec<u16> = Vec::with_capacity(8);
+    for (name, unit) in [
+        ("hasIndices", 'd'),
+        ("global", 'g'),
+        ("ignoreCase", 'i'),
+        ("multiline", 'm'),
+        ("dotAll", 's'),
+        ("unicode", 'u'),
+        ("unicodeSets", 'v'),
+        ("sticky", 'y'),
+    ] {
+        let this_val = vm.reg(args[0]);
         let this_ptr = this_val.as_js_object_ptr();
-        let proto_ptr = vm.session().builtin_world().regexp_proto.as_ptr() as *mut JsObject;
-        if !this_ptr.is_null() && this_ptr == proto_ptr {
-            return NativeResult::Ok(JsValue::undefined());
+        let v = match rx_get_bool_prop(vm, this_ptr, name, this_val) {
+            Ok(v) => v,
+            Err(err) => return NativeResult::Err(err),
+        };
+        if v {
+            out.push(unit as u16);
         }
     }
-    let re_ptr = match get_regexp_ptr(vm, args) {
-        Ok(ptr) => ptr,
-        Err(err) => return NativeResult::Err(err),
-    };
-    let re = unsafe { &*re_ptr };
-    NativeResult::Ok(re.get_regexp_flags())
+    NativeResult::Ok(vm.new_string_units(&out))
 }
 
 /// `RegExp.prototype.source` getter：返回实例 source 串。

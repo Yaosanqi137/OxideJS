@@ -1188,3 +1188,24 @@ fn regexp_v_flag_zero_width_surrogate_pair_match_returns() {
     let result = eval(&mut vm, "var m = '𠮷a'.match(/(?:)/g); m.length + ':' + m.join('|')").unwrap();
     assert_eq!(to_str(&vm, result), "4:|||");
 }
+
+// --- RegExp.prototype.flags getter ---
+
+#[test]
+fn flags_getter_plain_object_reads_accessor_props() {
+    // 无 [[RegExp]] 槽的对象 this：按规范序读 8 个旗访问器（hasIndices/
+    // global/ignoreCase/multiline/dotAll/unicode/unicodeSets/sticky）并以
+    // ToBoolean 判位组串；prototype 本身读得全 falsy 返空串。
+    let mut vm = Vm::new();
+    let result = eval(&mut vm, "var get = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get; get.call({ global: 'string', ignoreCase: 1 })").unwrap();
+    assert_eq!(to_str(&vm, result), "gi");
+    let result = eval(
+        &mut vm,
+        "var get = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get; get.call(RegExp.prototype)",
+    )
+    .unwrap();
+    assert_eq!(to_str(&vm, result), "");
+    // 非对象 this 抛 TypeError。
+    let result = eval(&mut vm, "var get = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get; try { get.call(4); 'no-throw' } catch (e) { e instanceof TypeError }").unwrap();
+    assert!(result.as_bool());
+}
