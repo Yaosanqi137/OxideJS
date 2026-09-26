@@ -470,5 +470,6 @@ fn not_implemented(command: &str) -> ExitCode {
     use ansi_term::Colour::Yellow;
     kernel_info!("command not yet implemented: {}", command);
     eprintln!("{}", Yellow.paint(format!("'{command}' is not yet implemented")));
-    ExitCode::SUCCESS
+    // 2 = 未实现，与 0=成功、1=运行失败区分，供脚本与 CI 识别。
+    ExitCode::from(2)
 }

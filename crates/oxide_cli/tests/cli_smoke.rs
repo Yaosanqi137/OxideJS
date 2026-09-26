@@ -64,6 +64,22 @@ fn eval_array_output() {
 }
 
 #[test]
+fn test_stub_exit_code() {
+    let output = Command::new(env!("CARGO_BIN_EXE_oxide"))
+        .args(["test"])
+        .output()
+        .expect("failed to run oxide test");
+
+    // 未实现子命令固定退出码 2，区别于 0=成功 / 1=运行失败。
+    assert_eq!(output.status.code(), Some(2), "test stub should exit 2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "test stub should print not-implemented notice: {stderr}"
+    );
+}
+
+#[test]
 fn bench_help() {
     let output = Command::new(env!("CARGO_BIN_EXE_oxide"))
         .args(["bench", "--help"])
