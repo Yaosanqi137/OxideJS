@@ -33,8 +33,22 @@ fn run_file() {
         .expect("failed to run oxide run");
 
     assert!(output.status.success(), "run hello.js should exit 0");
+    // run 臂不打印脚本完成值，stdout 应只含脚本自身输出（hello.js 无输出）。
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.trim() == "3", "run output should be '3': {stdout}");
+    assert!(stdout.trim().is_empty(), "run 不应打印完成值: {stdout}");
+}
+
+#[test]
+fn run_throw_script() {
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/throw.js");
+    let output = Command::new(env!("CARGO_BIN_EXE_oxide"))
+        .args(["run", fixture])
+        .output()
+        .expect("failed to run oxide run");
+
+    assert_eq!(output.status.code(), Some(1), "run throw.js should exit 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.is_empty(), "run 失败应输出 stderr: {stderr}");
 }
 
 #[test]

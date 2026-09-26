@@ -96,14 +96,15 @@ fn main() -> ExitCode {
         Some(Commands::Eval { code, trace }) => {
             let kernel = make_kernel(cli.verbose, cli.quiet);
             let pool = make_pool(&kernel);
-            eval(&code, &kernel, &pool, trace)
+            eval(&code, &kernel, &pool, trace, true)
         }
         Some(Commands::Run { file, repeat, trace }) => {
             let kernel = make_kernel(cli.verbose, cli.quiet);
             let pool = make_pool(&kernel);
             for n in 0..repeat {
                 let code = run(&file, &kernel, &pool, trace);
-                if code != ExitCode::SUCCESS && code != ExitCode::FAILURE {
+                // 失败即终止并传播退出码，供脚本与 CI 区分成败。
+                if code != ExitCode::SUCCESS {
                     return code;
                 }
                 if n + 1 < repeat {
@@ -161,7 +162,7 @@ fn make_pool(kernel: &Arc<KernelCore>) -> Arc<VmPool> {
     VmPool::new(Arc::clone(kernel), kernel.config.min_pool_size, kernel.config.max_pool_size)
 }
 
-fn eval(code: &str, kernel: &Arc<KernelCore>, pool: &Arc<VmPool>, trace: bool) -> ExitCode {
+fn eval(code: &str, kernel: &Arc<KernelCore>, pool: &Arc<VmPool>, trace: bool, print_result: bool) -> ExitCode {
     let allocator = Allocator::default();
     let program = match oxide_parser::parse(&allocator, code) {
         Ok(p) => p,
@@ -189,7 +190,10 @@ fn eval(code: &str, kernel: &Arc<KernelCore>, pool: &Arc<VmPool>, trace: bool) -
     guard.vm_mut().set_instruction_trace(trace);
     match guard.vm_mut().run(&module) {
         Ok(result) => {
-            format_result(guard.vm(), kernel.perm_interner().as_ref(), kernel.shape_forge().as_ref(), result);
+            // eval 臂按 REPL 语义打印完成值；run 臂脚本只输出自身产生内容。
+            if print_result {
+                format_result(guard.vm(), kernel.perm_interner().as_ref(), kernel.shape_forge().as_ref(), result);
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -293,7 +297,7 @@ fn format_array(
 
 fn run(file: &str, kernel: &Arc<KernelCore>, pool: &Arc<VmPool>, trace: bool) -> ExitCode {
     match fs::read_to_string(file) {
-        Ok(source) => eval(&source, kernel, pool, trace),
+        Ok(source) => eval(&source, kernel, pool, trace, false),
         Err(err) => {
             kernel_error!("cannot read {}: {}", file, err);
             eprintln!("{}", Red.paint(format!("Cannot read {file}: {err}")));
