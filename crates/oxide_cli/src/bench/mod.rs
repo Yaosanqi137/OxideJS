@@ -26,7 +26,6 @@ pub struct BenchConfig {
     pub filter: Option<String>,
     pub warmup: u32,
     pub iterations: u32,
-    pub process: bool,
     pub update_baseline: bool,
     pub leak_check_interval: usize,
 }

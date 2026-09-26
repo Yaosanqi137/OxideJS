@@ -78,8 +78,6 @@ enum Commands {
         #[arg(long, default_value = "10")]
         iterations: u32,
         #[arg(long)]
-        process: bool,
-        #[arg(long)]
         update_baseline: bool,
         #[arg(long, default_value = "1000")]
         leak_check_interval: usize,
@@ -124,7 +122,6 @@ fn main() -> ExitCode {
             filter,
             warmup,
             iterations,
-            process,
             update_baseline,
             leak_check_interval,
         }) => {
@@ -135,7 +132,6 @@ fn main() -> ExitCode {
                 filter,
                 warmup,
                 iterations,
-                process,
                 update_baseline,
                 leak_check_interval,
             };
