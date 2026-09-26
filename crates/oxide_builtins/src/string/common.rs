@@ -174,16 +174,6 @@ fn clamp_code_point_start(u: &[u16], idx: usize) -> usize {
     }
 }
 
-/// 给定码元位置之后的下一个码点边界（空匹配游标推进用）：跳过低 surrogate
-/// 位到下一码点起点；位置在串尾时返回串长+1（触发耗尽守卫）。
-pub(crate) fn next_code_point_boundary(u: &[u16], idx: usize) -> usize {
-    let mut j = idx + 1;
-    while j < u.len() && is_low_surrogate(u[j]) && is_high_surrogate(u[j - 1]) {
-        j += 1;
-    }
-    j
-}
-
 #[inline]
 fn is_low_surrogate(u: u16) -> bool {
     (0xDC00..=0xDFFF).contains(&u)

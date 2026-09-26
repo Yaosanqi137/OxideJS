@@ -684,7 +684,7 @@ fn install_to_string_tags(core: &Arc<KernelCore>, session: &KernelSession) {
         (world.map_iterator_proto.as_ptr() as *mut JsObject, "Map Iterator"),
         (world.set_iterator_proto.as_ptr() as *mut JsObject, "Set Iterator"),
         (world.string_iterator_proto.as_ptr() as *mut JsObject, "String Iterator"),
-        (world.regexp_string_iterator_proto.as_ptr() as *mut JsObject, "String Iterator"),
+        (world.regexp_string_iterator_proto.as_ptr() as *mut JsObject, "RegExp String Iterator"),
         (world.math_object.as_ptr() as *mut JsObject, "Math"),
         (world.json_object.as_ptr() as *mut JsObject, "JSON"),
         (world.symbol_proto.as_ptr() as *mut JsObject, "Symbol"),

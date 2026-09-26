@@ -126,7 +126,7 @@ fn get_this_obj<H: VmHost>(vm: &mut H, args: &[u8]) -> Result<*mut JsObject, JsV
 
 /// ToLength(Get) 读值的收尾口径：完整对象强转（对象经 ToPrimitive 触发
 /// valueOf/toString，转换异常传播）后按 ToLength 收敛到 [0, 2^53-1]。
-fn to_length_value<H: VmHost>(vm: &mut H, val: JsValue) -> Result<usize, JsValue> {
+pub(crate) fn to_length_value<H: VmHost>(vm: &mut H, val: JsValue) -> Result<usize, JsValue> {
     let n = match oxide_runtime_api::to_number_full(val, vm) {
         Ok(n) => n,
         Err(e) => {
@@ -157,7 +157,9 @@ fn set_last_index<H: VmHost>(
 
 /// 以 Get 语义按名读属性：完整属性解析（自身数据/自身 accessor/原型链），
 /// getter 抛错时恢复原异常值。
-fn rx_get_prop<H: VmHost>(vm: &mut H, obj: *mut JsObject, name: &str, this_val: JsValue) -> Result<JsValue, JsValue> {
+pub(crate) fn rx_get_prop<H: VmHost>(
+    vm: &mut H, obj: *mut JsObject, name: &str, this_val: JsValue,
+) -> Result<JsValue, JsValue> {
     let si = vm.kernel_core().perm_interner().intern(name).0;
     match vm.ordinary_get(unsafe { &*obj }, si, this_val) {
         Ok(v) => Ok(v),
@@ -165,9 +167,11 @@ fn rx_get_prop<H: VmHost>(vm: &mut H, obj: *mut JsObject, name: &str, this_val: 
     }
 }
 
-/// 以 Get 语义读结果数组的数值下标属性：下标经规范整数键换算（与字符串
-/// "0" 形态同键），读异常恢复原异常值。
-fn rx_get_index<H: VmHost>(vm: &mut H, obj: *mut JsObject, idx: i32, receiver: JsValue) -> Result<JsValue, JsValue> {
+/// 以 Get 语义读数值下标属性：下标经规范整数键换算（与字符串 "0" 形态
+/// 同键），读异常恢复原异常值。
+pub(crate) fn rx_get_index<H: VmHost>(
+    vm: &mut H, obj: *mut JsObject, idx: i32, receiver: JsValue,
+) -> Result<JsValue, JsValue> {
     let si = vm.property_key_si(JsValue::int(idx));
     match vm.ordinary_get(unsafe { &*obj }, si, receiver) {
         Ok(v) => Ok(v),
@@ -176,7 +180,7 @@ fn rx_get_index<H: VmHost>(vm: &mut H, obj: *mut JsObject, idx: i32, receiver: J
 }
 
 /// 以 Set 语义（strict）按名写属性：写失败（非可写等）恢复原异常值。
-fn rx_set_prop<H: VmHost>(
+pub(crate) fn rx_set_prop<H: VmHost>(
     vm: &mut H, obj: *mut JsObject, name: &str, val: JsValue, this_val: JsValue,
 ) -> Result<(), JsValue> {
     let si = vm.kernel_core().perm_interner().intern(name).0;
@@ -257,7 +261,7 @@ fn species_constructor<H: VmHost>(
 
 /// AdvanceStringIndex：零宽匹配后的推进——无条件前移，unicode 口径下起点对
 /// 代理对跨两个单元，其余跨一个码元（越出串长同样前移，与实现语义一致）。
-fn advance_string_index(units: &[u16], p: usize, unicode: bool) -> usize {
+pub(crate) fn advance_string_index(units: &[u16], p: usize, unicode: bool) -> usize {
     if unicode
         && p < units.len()
         && (0xD800..=0xDBFF).contains(&units[p])
@@ -615,7 +619,7 @@ pub fn regexp_test<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 ///
 /// # 副作用
 /// - global/sticky 时按匹配结果 Set this.lastIndex（越界/失败置 0、成功置末尾）。
-fn rx_search<H: VmHost>(
+pub(crate) fn rx_search<H: VmHost>(
     vm: &mut H, re_ptr: *mut JsObject, this_val: JsValue, regex: &regress::Regex, text: &MatchText,
     tracks_last_index: bool, is_sticky: bool,
 ) -> Result<Option<regress::Match>, JsValue> {
@@ -1764,8 +1768,9 @@ pub fn regexp_symbol_split<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 ///    非 RegExp 走 Construct(%RegExp%, «R, "g"»)。
 /// 4. lastIndex = ToLength(Get(R, "lastIndex"))——只从 R 读一次；
 ///    Set(matcher, "lastIndex", lastIndex)。
-/// 5. global/fullUnicode 由 flags 串判定（不读构造产物属性）。
-/// 6. 迭代器包装保持三槽（input/index/re）形态。
+/// 5. global/fullUnicode 由 flags 串判定（不读构造产物属性；u/v 均码点口径）。
+/// 6. 迭代器包装为五槽（input/re/done/global/unicode），游标归匹配器
+///    lastIndex。
 ///
 /// # 边界与前提
 /// - 各属性读（flags/@@match/lastIndex）均传播原异常。
@@ -1788,6 +1793,9 @@ pub fn regexp_symbol_match_all<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResu
         Ok(f) => f,
         Err(err) => return NativeResult::Err(err),
     };
+    // [[Global]]/[[Unicode]] 由 flags 串判定（u/v 均码点口径），不读构造产物属性。
+    let is_global = flags.contains('g');
+    let is_unicode = flags.contains('u') || flags.contains('v');
 
     // 旧式 IsRegExp：Get(R, @@match) 为布尔取之，否则 true。
     let match_key = oxide_types::private_key::make_well_known_symbol_key(1);
@@ -1837,16 +1845,21 @@ pub fn regexp_symbol_match_all<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResu
         return NativeResult::Err(err);
     }
 
-    // 迭代器包装：三槽（input/index/re），next 由原型提供。
+    // 迭代器包装：五槽（input/re/done/global/unicode），next 由原型提供。
     let regexp_iter_proto = vm.session().builtin_world().regexp_string_iterator_proto.as_ptr() as *mut JsObject;
     let wrapper = vm.alloc_object(JsObject::new_empty(EMPTY_SHAPE_ID, JsValue::from_js_object(regexp_iter_proto)));
     let wrapper_obj = unsafe { &mut *wrapper };
     let input_si = vm.kernel_core().perm_interner().intern(crate::string::MALL_INPUT).0;
-    let index_si = vm.kernel_core().perm_interner().intern(crate::string::MALL_INDEX).0;
     let re_si = vm.kernel_core().perm_interner().intern(crate::string::MALL_RE).0;
-    // input 属性存完整转换后的字符串值（单元保真）；index 游标为码元口径。
+    let done_si = vm.kernel_core().perm_interner().intern(crate::string::MALL_DONE).0;
+    let global_si = vm.kernel_core().perm_interner().intern(crate::string::MALL_GLOBAL).0;
+    let unicode_si = vm.kernel_core().perm_interner().intern(crate::string::MALL_UNICODE).0;
+    // [[Global]]/[[Unicode]] 由 flags 串判定（u/v 均码点口径）；input 属性存
+    // 完整转换后的字符串值（单元保真），游标归匹配器 lastIndex（已写入）。
     vm.set_or_create_prop_value(wrapper_obj, input_si, s_val);
-    vm.set_or_create_prop_value(wrapper_obj, index_si, JsValue::int(last_index as i32));
     vm.set_or_create_prop_value(wrapper_obj, re_si, matcher_val);
+    vm.set_or_create_prop_value(wrapper_obj, done_si, JsValue::bool(false));
+    vm.set_or_create_prop_value(wrapper_obj, global_si, JsValue::bool(is_global));
+    vm.set_or_create_prop_value(wrapper_obj, unicode_si, JsValue::bool(is_unicode));
     NativeResult::Ok(JsValue::from_js_object(wrapper))
 }

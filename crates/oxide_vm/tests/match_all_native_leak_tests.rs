@@ -69,7 +69,8 @@ fn string_pattern_match_all_iterator_survives_full_collect() {
     assert_eq!(to_str(&vm, result), "ab,ab");
 }
 
-/// 非 global 正则路径的存活载体同样跨收集保持有效。
+/// 非 global 正则路径的存活载体同样跨收集保持有效：非 global 匹配器
+/// 只产一枚匹配后 done（[[Global]] false 分支），存活判据是该枚匹配。
 #[test]
 fn non_global_regexp_match_all_iterator_survives_full_collect() {
     let mut vm = Vm::new();
@@ -80,7 +81,7 @@ fn non_global_regexp_match_all_iterator_survives_full_collect() {
         "var out = []; var st = it.next(); while (!st.done) { out.push(String(st.value[0])); st = it.next(); } out.join(',')",
     )
     .unwrap();
-    assert_eq!(to_str(&vm, result), "ab,ab");
+    assert_eq!(to_str(&vm, result), "ab");
 }
 
 /// 载体经内部属性可达，但无 RegExp 属性面：toString 保持普通对象标签。

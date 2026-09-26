@@ -10,8 +10,8 @@ use crate::regexp::build_groups_object;
 
 use super::common::{try_string, MatchText};
 use super::{
-    as_units, find_units, first_match_units, make_string_array_values, make_units_array, map_well_formed_segments,
-    next_code_point_boundary, split_limit_to_uint32, this_text, this_units,
+    as_units, find_units, make_string_array_values, make_units_array, map_well_formed_segments, split_limit_to_uint32,
+    this_text, this_units,
 };
 
 // ── 正则替换（单元口径） ────────────────────────────────────────────────
@@ -760,12 +760,14 @@ pub fn string_normalize<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 }
 
 pub(crate) const MALL_INPUT: &str = "__mal_input__";
-pub(crate) const MALL_INDEX: &str = "__mal_index__";
 pub(crate) const MALL_RE: &str = "__mal_re__";
+pub(crate) const MALL_DONE: &str = "__mal_done__";
+pub(crate) const MALL_GLOBAL: &str = "__mal_global__";
+pub(crate) const MALL_UNICODE: &str = "__mal_unicode__";
 
 /// `String.prototype.matchAll(pattern)`：返回带 `next` 的迭代器，逐步产出全部匹配
 /// （要求 RegExp 带 global 标志；普通字符串会被转义成等效正则）。包装器 input
-/// 属性存原始字符串值（单元保真），index 属性为码元游标。
+/// 属性存原始字符串值（单元保真），游标归匹配器 lastIndex。
 ///
 /// # 步骤
 /// 1. receiver 前置校验（RequireObjectCoercible，纯 is_* 读取）。
@@ -886,6 +888,9 @@ pub fn string_match_all<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         // 载体专型标签：native_fn 槽的 Box 经 RegExp 同一守卫释放/深拷贝，
         // 避免每次 matchAll 泄漏一个已编译正则。
         stub.type_tag = oxide_types::object::JsObject::OBJ_TYPE_REGEX_STUB;
+        // 载体语义即 RegExpCreate(pattern, "g")：flags 字段物化 "g"，使
+        // g/y/d 判定（regexp_has_flag 读实例字段）与真 RegExp 同径。
+        stub.set_regexp_flags(vm.new_string("g"));
         let boxed = Box::new(compiled);
         let raw = Box::into_raw(boxed) as *const u8;
         stub.set_native_fn(Some(unsafe { oxide_types::object::NativeFnPtr::from_raw(raw as *const ()) }));
@@ -961,7 +966,12 @@ fn match_all_construct_invoke<H: VmHost>(vm: &mut H, this_val: JsValue, pattern_
 }
 
 /// 构造 matchAll 包装对象：原型挂 `%RegExpStringIteratorPrototype%`，
-/// own 属性为 input/index(0)/re 三槽，next 由原型提供。
+/// own 属性为 input/re/done/global/unicode 五槽（内部槽物化形态），
+/// next 由原型提供。
+///
+/// # 边界与前提
+/// - 字符串 pattern 臂调用方：global 恒真（载体语义 = RegExpCreate(pattern, "g")）、
+///   unicode 恒假（无 u/v 标志）；游标归匹配器 lastIndex，包装器不存游标。
 fn builder_wrapper<H: VmHost>(vm: &mut H, input_val: JsValue, re_obj: JsValue) -> NativeResult {
     // matchAll 迭代器挂 %RegExpStringIteratorPrototype%（链到 %IteratorPrototype%），
     // next 由原型提供（不挂实例 own）。
@@ -970,12 +980,16 @@ fn builder_wrapper<H: VmHost>(vm: &mut H, input_val: JsValue, re_obj: JsValue) -
 
     let wrapper_obj = unsafe { &mut *wrapper };
     let input_si = vm.kernel_core().perm_interner().intern(MALL_INPUT).0;
-    let index_si = vm.kernel_core().perm_interner().intern(MALL_INDEX).0;
     let re_si = vm.kernel_core().perm_interner().intern(MALL_RE).0;
+    let done_si = vm.kernel_core().perm_interner().intern(MALL_DONE).0;
+    let global_si = vm.kernel_core().perm_interner().intern(MALL_GLOBAL).0;
+    let unicode_si = vm.kernel_core().perm_interner().intern(MALL_UNICODE).0;
 
     vm.set_or_create_prop_value(wrapper_obj, input_si, input_val);
-    vm.set_or_create_prop_value(wrapper_obj, index_si, JsValue::int(0));
     vm.set_or_create_prop_value(wrapper_obj, re_si, re_obj);
+    vm.set_or_create_prop_value(wrapper_obj, done_si, JsValue::bool(false));
+    vm.set_or_create_prop_value(wrapper_obj, global_si, JsValue::bool(true));
+    vm.set_or_create_prop_value(wrapper_obj, unicode_si, JsValue::bool(false));
 
     NativeResult::Ok(JsValue::from_js_object(wrapper))
 }
@@ -1015,8 +1029,30 @@ pub fn string_symbol_iterator<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResul
     NativeResult::Ok(crate::iterator::build_iterator_wrapper(vm, s_val, None, true, Some(string_iter_proto)))
 }
 
-/// `matchAll` 迭代器的 `next`：返回 `{value: 匹配数组, done}`，耗尽后 done 为 true。
-/// 游标为码元位置（两臂统一口径）；空匹配推进 1 个码元。
+/// `matchAll` 迭代器的 `next`：返回 `{value: 匹配, done: false}`，耗尽后
+/// done 为 true。
+///
+/// # 步骤
+/// 1. this 非对象抛 TypeError；五内部槽缺一即抛 TypeError（RequireInternalSlot）。
+/// 2. `[[Done]]` 为 true → done 结果。
+/// 3. `match = RegExpExec(regexp, string)`：`exec` 属性可调用 →
+///    Call(exec, regexp, «string»)，结果非对象非 null 抛 TypeError；不可调用 →
+///    regexp 持编译正则时落内置搜索核（RegExpBuiltinExec 口径），否则
+///    TypeError。
+/// 4. match 为 null → 写 `[[Done]]` = true，done 结果。
+/// 5. `[[Global]]` 为 false → 写 `[[Done]]` = true，返回单匹配（非 global
+///    匹配器只产一枚）。
+/// 6. 空匹配（ToString(match["0"]) 为空串）→ lastIndex 读-推进-写：
+///    thisIndex = ToLength(Get(regexp, "lastIndex"))，nextIndex =
+///    AdvanceStringIndex（u/v 口径跨代理对 2 单元），Set(regexp, "lastIndex")。
+/// 7. 返回 `{value: match, done: false}`。
+///
+/// # 边界与前提
+/// - 各读/调/写（exec getter 与调用、match."0" 读与 ToString、lastIndex
+///   Get/Set/ToLength）的原异常原值传播。
+///
+/// # 副作用
+/// - 写包装器 `[[Done]]` 槽；空匹配臂写匹配器 lastIndex。
 pub fn string_match_all_next<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let this_val = vm.reg(if args.is_empty() { 0 } else { args[0] });
     if !this_val.is_object() {
@@ -1024,104 +1060,158 @@ pub fn string_match_all_next<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult
     }
     let wrapper = unsafe { &mut *this_val.as_js_object_ptr() };
     let input_si = vm.kernel_core().perm_interner().intern(MALL_INPUT).0;
-    let index_si = vm.kernel_core().perm_interner().intern(MALL_INDEX).0;
     let re_si = vm.kernel_core().perm_interner().intern(MALL_RE).0;
+    let done_si = vm.kernel_core().perm_interner().intern(MALL_DONE).0;
+    let global_si = vm.kernel_core().perm_interner().intern(MALL_GLOBAL).0;
+    let unicode_si = vm.kernel_core().perm_interner().intern(MALL_UNICODE).0;
 
-    let input_val = match vm.ordinary_get(wrapper, input_si, this_val) {
-        Ok(v) if v.is_string() => v,
-        _ => return make_match_done_result(vm, JsValue::undefined()),
-    };
-    let idx_val = match vm.ordinary_get(wrapper, index_si, this_val) {
+    // 内部槽守卫：五槽同批写入，查一槽即全查；缺失即 TypeError。
+    if vm.get_own_property_slot(wrapper, done_si).is_none() {
+        return NativeResult::Err(crate::error::create_type_error(
+            vm,
+            "matchAll next called on object without internal slots",
+        ));
+    }
+
+    // [[Done]] 为 true → done 结果。
+    let done_val = match vm.ordinary_get(wrapper, done_si, this_val) {
         Ok(v) => v,
-        Err(_) => return make_match_done_result(vm, JsValue::undefined()),
+        Err(_) => return NativeResult::Err(crate::iterator::engine_error(vm, "cannot read done slot")),
     };
-    let idx_raw = if idx_val.is_int() { idx_val.as_int().max(0) } else { 0 };
-    let idx = idx_raw as usize;
+    if oxide_runtime_api::to_boolean(done_val) {
+        return make_match_done_result(vm, JsValue::undefined());
+    }
+
+    // 读余下四槽：input / re / global / unicode。
+    let input_val = match vm.ordinary_get(wrapper, input_si, this_val) {
+        Ok(v) => v,
+        Err(_) => return NativeResult::Err(crate::iterator::engine_error(vm, "cannot read input slot")),
+    };
     let re_val = match vm.ordinary_get(wrapper, re_si, this_val) {
         Ok(v) if v.is_object() => v,
-        _ => return make_match_done_result(vm, JsValue::undefined()),
-    };
-    let re_obj = unsafe { &*re_val.as_js_object_ptr() };
-    let fn_ptr = match re_obj.native_fn() {
-        Some(p) => p,
-        None => return make_match_done_result(vm, JsValue::undefined()),
-    };
-    let regex = unsafe { &*(fn_ptr.as_ptr() as *const regress::Regex) };
-    // d 标志门控 indices 产出（flags 串实例字段直读，与 exec 同口径）。
-    let has_indices = crate::regexp::regexp_has_flag(vm, re_obj, 'd');
-
-    // 按 input 载荷形态分臂：ASCII Flat 走字节通道（字节==码元，游标与匹配
-    // 范围同口径，无需换算）；非 ASCII Flat 与其余载荷走单元通道，按标志
-    // 分派（u/v 码点、其余码元，见 first_match_units）。
-    // SAFETY: input_val 已校验为字符串值，裸指针借用压缩到单个表达式。
-    let sp = unsafe { &*input_val.as_string_ptr() };
-    // 耗尽守卫：空匹配正则（如 /(?:)/g、/a*/g）在串尾会反复命中同一末端空
-    // 匹配，游标推进越过码元总数后须直接 done，否则同一末端空匹配死循环。
-    let total_units = sp.utf16_len() as usize;
-    if idx > total_units {
-        return make_match_done_result(vm, JsValue::undefined());
-    }
-    // 元素按值混排：匹配片段物化字符串值，未匹配捕获组为 undefined。
-    let (match_start, next_idx, parts, m_opt): (usize, usize, Vec<JsValue>, Option<regress::Match>) = if sp.is_flat()
-        && sp.as_str().is_ascii()
-    {
-        let s = sp.as_str();
-        match regex.find_from(s, idx).next() {
-            Some(m) => {
-                let range = m.range();
-                let mut parts = Vec::with_capacity(m.captures.len() + 1);
-                parts.push(vm.new_string_units_owned(s[range.start..range.end].encode_utf16().collect()));
-                for i in 1..=m.captures.len() {
-                    match m.group(i) {
-                        Some(g) => parts.push(vm.new_string_units_owned(s[g.start..g.end].encode_utf16().collect())),
-                        None => parts.push(JsValue::undefined()),
-                    }
-                }
-                // 空匹配（range 无推进）须推进至少一个码元，否则同一位置反复
-                // 空匹配死循环；非空匹配游标落匹配末尾（码元口径）。
-                let next_idx = if range.end > range.start { range.end } else { range.end + 1 };
-                (range.start, next_idx, parts, Some(m))
-            }
-            None => (0, 0, Vec::new(), None),
+        _ => {
+            return NativeResult::Err(crate::error::create_type_error(vm, "matchAll next called on non-object regexp"))
         }
+    };
+    let is_global = match vm.ordinary_get(wrapper, global_si, this_val) {
+        Ok(v) => oxide_runtime_api::to_boolean(v),
+        Err(_) => return NativeResult::Err(crate::iterator::engine_error(vm, "cannot read global slot")),
+    };
+    let is_unicode = match vm.ordinary_get(wrapper, unicode_si, this_val) {
+        Ok(v) => oxide_runtime_api::to_boolean(v),
+        Err(_) => return NativeResult::Err(crate::iterator::engine_error(vm, "cannot read unicode slot")),
+    };
+    let re_ptr = re_val.as_js_object_ptr();
+    let re_obj = unsafe { &*re_ptr };
+
+    // ── RegExpExec(R, S) ──
+
+    // Get(R, "exec")：getter 抛错原值传播。
+    let exec_val = match crate::regexp::rx_get_prop(vm, re_ptr, "exec", re_val) {
+        Ok(v) => v,
+        Err(err) => return NativeResult::Err(err),
+    };
+    let match_val = if crate::iterator::is_callable(exec_val) {
+        // Call(exec, R, «S»)：调用抛错原值传播；结果非对象非 null 抛 TypeError。
+        let result = match vm.call_function_sync(exec_val, re_val, &[input_val]) {
+            Ok(r) => r,
+            Err(_) => return NativeResult::Err(crate::iterator::engine_error(vm, "RegExp exec call failed")),
+        };
+        if !(result.is_null() || result.is_object()) {
+            return NativeResult::Err(crate::error::create_type_error(
+                vm,
+                "RegExp exec result must be an object or null",
+            ));
+        }
+        result
     } else {
-        let u = sp.units();
-        let is_code_point = regex.flags().unicode || regex.flags().unicode_sets;
-        match first_match_units(regex, &u, idx) {
+        // 不可调用回落：仅 regexp 持编译正则（真 RegExp 或字符串 pattern 载体）
+        // 可走内置搜索核，否则 RequireInternalSlot 失败。
+        let fn_ptr = match re_obj.native_fn() {
+            Some(p) => p,
+            None => return NativeResult::Err(crate::error::create_type_error(vm, "RegExp exec is not callable")),
+        };
+        // SAFETY: fn_ptr 持有 regexp_constructor 存放的 `Box<regress::Regex>` 指针。
+        let regex = unsafe { &*(fn_ptr.as_ptr() as *const regress::Regex) };
+        let text = MatchText::from_value(input_val);
+        // g/y 标志决定 lastIndex 追踪（与 exec/test 同口径）。
+        let tracks = crate::regexp::regexp_has_flag(vm, re_obj, 'g') || crate::regexp::regexp_has_flag(vm, re_obj, 'y');
+        let sticky = crate::regexp::regexp_has_flag(vm, re_obj, 'y');
+        let m = match crate::regexp::rx_search(vm, re_ptr, re_val, regex, &text, tracks, sticky) {
+            Ok(opt) => opt,
+            Err(err) => return NativeResult::Err(err),
+        };
+        match m {
+            None => JsValue::null(),
             Some(m) => {
-                let range = m.range();
-                let mut parts = Vec::with_capacity(m.captures.len() + 1);
-                parts.push(vm.new_string_units_owned(u[range.start..range.end].to_vec()));
-                for i in 1..=m.captures.len() {
-                    match m.group(i) {
-                        Some(g) => parts.push(vm.new_string_units_owned(u[g.start..g.end].to_vec())),
-                        None => parts.push(JsValue::undefined()),
-                    }
-                }
-                // 非空匹配游标落匹配末尾；空匹配推进到下一码点边界（u/v
-                // 标志）或下一码元（其余），串尾空匹配推进到串长+1 触发耗尽。
-                let next_idx = if range.end > range.start {
-                    range.end
-                } else if is_code_point {
-                    next_code_point_boundary(&u, range.end)
-                } else {
-                    range.end + 1
-                };
-                (range.start, next_idx, parts, Some(m))
+                // d 标志门控 indices 产出（与 exec 同口径）。
+                let has_indices = crate::regexp::regexp_has_flag(vm, re_obj, 'd');
+                let parts = match_parts(vm, &text, &m);
+                make_match_result_array(vm, parts, m.range().start as i32, input_val, Some(&m), &text, has_indices)
             }
-            None => (0, 0, Vec::new(), None),
         }
     };
 
-    if parts.is_empty() {
+    // match 为 null → 写 [[Done]] = true，done 结果。
+    if match_val.is_null() {
+        vm.set_or_create_prop_value(wrapper, done_si, JsValue::bool(true));
         return make_match_done_result(vm, JsValue::undefined());
     }
-    vm.set_or_create_prop_value(wrapper, index_si, JsValue::int(next_idx as i32));
-    // 构建结果数组：按元素混排字符串值/undefined + 挂 index/input/groups 属性。
-    let match_text = MatchText::from_value(input_val);
-    let value =
-        make_match_result_array(vm, parts, match_start as i32, input_val, m_opt.as_ref(), &match_text, has_indices);
-    make_match_done_result(vm, value)
+
+    // [[Global]] 为 false → 写 [[Done]] = true，返回单匹配。
+    if !is_global {
+        vm.set_or_create_prop_value(wrapper, done_si, JsValue::bool(true));
+        return make_match_done_result(vm, match_val);
+    }
+
+    // matchString = ToString(Get(match, "0"))：下标经整数键换算（数组元素区
+    // 按整数键存储），getter 与 ToString 抛错原值传播。
+    let m0 = match crate::regexp::rx_get_index(vm, match_val.as_js_object_ptr(), 0, match_val) {
+        Ok(v) => v,
+        Err(err) => return NativeResult::Err(err),
+    };
+    let m0_str = match oxide_runtime_api::to_string_value_full(m0, vm) {
+        Ok(v) => v,
+        Err(_) => {
+            if let Some(exc) = vm.take_uncaught_value() {
+                return NativeResult::Err(exc);
+            }
+            return NativeResult::Err(crate::error::create_type_error(vm, "Cannot convert value to a string"));
+        }
+    };
+    // 空匹配 → lastIndex 读-推进-写（内置臂 lastIndex 为 rx_search 写入的
+    // 匹配末尾，自定义 exec 臂为用户代码已设值）。
+    if vm.string_units(m0_str).is_empty() {
+        let li_val = match crate::regexp::rx_get_prop(vm, re_ptr, "lastIndex", re_val) {
+            Ok(v) => v,
+            Err(err) => return NativeResult::Err(err),
+        };
+        let this_index = match crate::regexp::to_length_value(vm, li_val) {
+            Ok(n) => n,
+            Err(err) => return NativeResult::Err(err),
+        };
+        let units = vm.string_units(input_val);
+        let next_index = crate::regexp::advance_string_index(&units, this_index, is_unicode);
+        if let Err(err) = crate::regexp::rx_set_prop(vm, re_ptr, "lastIndex", JsValue::int(next_index as i32), re_val) {
+            return NativeResult::Err(err);
+        }
+    }
+    make_match_done_result(vm, match_val)
+}
+
+/// 由匹配结果构建结果数组元素列表：完整匹配字符串值在前，其后逐捕获组
+/// （未参与匹配为 undefined），片段经 MatchText 臂的单元口径物化。
+fn match_parts<H: VmHost>(vm: &mut H, text: &MatchText, m: &regress::Match) -> Vec<JsValue> {
+    let range = m.range();
+    let mut parts = Vec::with_capacity(m.captures.len() + 1);
+    parts.push(vm.new_string_units_owned(text.slice(range.start, range.end).into_owned()));
+    for i in 1..=m.captures.len() {
+        match m.group(i) {
+            Some(g) => parts.push(vm.new_string_units_owned(text.slice(g.start, g.end).into_owned())),
+            None => parts.push(JsValue::undefined()),
+        }
+    }
+    parts
 }
 
 /// 构建 matchAll 结果数组：元素为匹配字符串值（未匹配捕获组为 undefined），
