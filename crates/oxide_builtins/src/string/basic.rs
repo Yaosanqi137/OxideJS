@@ -9,6 +9,9 @@ use crate::builtins_error;
 use super::common::try_string;
 use super::{as_units, find_units, is_trim_unit, map_well_formed_segments, rfind_units, this_units};
 
+// 串长上界（V8 kMaxStringLength，node 20.19.2 逐位核）：pad 目标长度越界抛 RangeError。
+const MAX_STRING_LENGTH: usize = 536870888;
+
 // ── 静态方法 / 构造 ─────────────────────────────────────────────────────
 
 /// `String.fromCharCode(...codes)`：各参数经 ToUint16(ToNumber) 转单元拼接
@@ -655,8 +658,8 @@ pub fn string_pad_start<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     // 可观察操作序由规范钉死：receiver ToString 先行，后 targetLength 转换，
     // 再 padString ToString。
     let s: Vec<u16> = try_string!(this_units(vm, args)).into_owned();
-    // targetLength：ToIntegerOrInfinity 传播式，负值归 0；+Inf 经既有 10000
-    // 上限检查自然落 RangeError。
+    // targetLength：ToIntegerOrInfinity 传播式，负值归 0；+Inf 经既有串长
+    // 上限（536870888）检查自然落 RangeError。
     let target = if args.len() > 1 {
         let p = match to_integer_or_infinity_bounded(vm, vm.reg(args[1])) {
             Ok(p) => p,
@@ -679,8 +682,7 @@ pub fn string_pad_start<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if s_len >= target {
         return NativeResult::Ok(vm.new_string_units_owned(s));
     }
-    if target > 10000 {
-        builtins_error!("String.prototype.padStart: invalid receiver");
+    if target > MAX_STRING_LENGTH {
         return NativeResult::Err(crate::error::create_range_error(vm, "Invalid string length"));
     }
     if pad.is_empty() {
@@ -707,8 +709,8 @@ pub fn string_pad_end<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     // 可观察操作序由规范钉死：receiver ToString 先行，后 targetLength 转换，
     // 再 padString ToString。
     let s: Vec<u16> = try_string!(this_units(vm, args)).into_owned();
-    // targetLength：ToIntegerOrInfinity 传播式，负值归 0；+Inf 经既有 10000
-    // 上限检查自然落 RangeError。
+    // targetLength：ToIntegerOrInfinity 传播式，负值归 0；+Inf 经既有串长
+    // 上限（536870888）检查自然落 RangeError。
     let target = if args.len() > 1 {
         let p = match to_integer_or_infinity_bounded(vm, vm.reg(args[1])) {
             Ok(p) => p,
@@ -731,8 +733,7 @@ pub fn string_pad_end<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if s_len >= target {
         return NativeResult::Ok(vm.new_string_units_owned(s));
     }
-    if target > 10000 {
-        builtins_error!("String.prototype.padEnd: invalid receiver");
+    if target > MAX_STRING_LENGTH {
         return NativeResult::Err(crate::error::create_range_error(vm, "Invalid string length"));
     }
     if pad.is_empty() {
