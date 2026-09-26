@@ -3,6 +3,7 @@
 //! 重建信号。
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -34,8 +35,13 @@ pub struct KernelCore {
 impl KernelCore {
     /// 按配置创建共享核心：初始化日志系统与四个共享 forge（interner/shape/code/prop）。
     pub fn new(config: KernelConfig) -> Arc<Self> {
+        // OXIDE_LOG_FILE 指向目录时日志按日滚动落盘该目录（同镜像 stderr），缺省仅 stderr。
+        let output = match std::env::var("OXIDE_LOG_FILE") {
+            Ok(dir) if !dir.is_empty() => oxide_log::Output::File(PathBuf::from(dir)),
+            _ => oxide_log::Output::Stderr,
+        };
         oxide_log::init(&oxide_log::LogConfig {
-            output: oxide_log::Output::Stderr,
+            output,
             levels: config.log_levels,
         });
         let perm_interner = Arc::new(PermInterner::new());

@@ -95,8 +95,13 @@ fn run_tests() -> bool {
         }
     }
     eprintln!("[LOG] level={log_level:?}");
+    // OXIDE_LOG_FILE 指向目录时日志按日滚动落盘该目录（同镜像 stderr），缺省仅 stderr。
+    let output = match std::env::var("OXIDE_LOG_FILE") {
+        Ok(dir) if !dir.is_empty() => Output::File(PathBuf::from(dir)),
+        _ => Output::Stderr,
+    };
     oxide_log::init(&LogConfig {
-        output: Output::Stderr,
+        output,
         levels: [log_level; SUBSYSTEM_COUNT],
     });
 
