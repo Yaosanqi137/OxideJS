@@ -1,5 +1,6 @@
 use oxide_kernel::shape_forge::EMPTY_SHAPE_ID;
 use oxide_types::object::{JsObject, PropMetaEntry};
+use oxide_types::private_key::is_int_key;
 use oxide_types::value::JsValue;
 
 use crate::array::{arraylike_get, from_engine_error, is_constructor_value};
@@ -11,6 +12,12 @@ use oxide_runtime_api::{to_length, NativeResult, VmHost};
 const MAX_PROTO_CHAIN_DEPTH: usize = 1024;
 
 /// `Reflect.apply(target, thisArgument, argumentsList)`：以指定 this 与参数数组调用函数。
+///
+/// # 步骤
+/// 1. IsCallable(target) 为 false → TypeError；argumentsList 非对象 → TypeError。
+/// 2. CreateListFromArrayLike：规范读 length（访问器异常原值传播）、ToLength、
+///    逐索引规范 Get。
+/// 3. Call(target, thisArgument, args)；调用异常原值传播。
 pub fn reflect_apply<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let target = arg(vm, args, 1);
     let this_arg = arg(vm, args, 2);
@@ -18,12 +25,30 @@ pub fn reflect_apply<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if !is_callable(target) {
         return type_error(vm, "Reflect.apply target is not callable");
     }
-    let Some(call_args) = array_like_elements(arg_list) else {
+    let Some(arg_list_ptr) = object_ptr(arg_list) else {
         return type_error(vm, "Reflect.apply argumentsList must be an array-like object");
     };
+    // SAFETY: object_ptr 保证指针非空且指向存活对象。
+    let arg_list_obj = unsafe { &*arg_list_ptr };
+
+    // CreateListFromArrayLike：规范读 length（访问器异常原值传播），ToLength 纯函数不抛。
+    let length_si = vm.kernel_core().perm_interner().intern("length").0;
+    let len_val = match vm.ordinary_get(arg_list_obj, length_si, arg_list) {
+        Ok(v) => v,
+        Err(msg) => return NativeResult::Err(from_engine_error(vm, &msg)),
+    };
+    let len = to_length(len_val) as usize;
+    let mut call_args = Vec::with_capacity(len);
+    for i in 0..len {
+        match arraylike_get(vm, arg_list_ptr, i) {
+            Ok(v) => call_args.push(v),
+            Err(exc) => return NativeResult::Err(exc),
+        }
+    }
+
     match vm.call_function_sync(target, this_arg, &call_args) {
         Ok(value) => NativeResult::Ok(value),
-        Err(err) => type_error(vm, &err),
+        Err(err) => NativeResult::Err(from_engine_error(vm, &err)),
     }
 }
 
@@ -103,7 +128,9 @@ pub fn reflect_define_property<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResu
 
     match crate::object::define_from_descriptor(vm, target_ptr, key_si, desc_val) {
         Ok(()) => NativeResult::Ok(JsValue::bool(true)),
-        Err(msg) => {
+        // 描述符字段读取期用户代码（accessor getter）抛出的异常原值传播。
+        Err(crate::object::DefineDescFailure::User(exc)) => NativeResult::Err(exc),
+        Err(crate::object::DefineDescFailure::Engine(msg)) => {
             // 强转期用户代码（valueOf / Symbol.toPrimitive）抛出的异常值转存专用槽，
             // 须原值重抛，不得投影为 false 或改写成引擎错误。
             if let Some(exc) = vm.take_pending_length_exception() {
@@ -147,7 +174,8 @@ pub fn reflect_get<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let receiver = if args.len() > 3 { vm.reg(args[3]) } else { target_val };
     match vm.ordinary_get(unsafe { &*target_ptr }, key_si, receiver) {
         Ok(value) => NativeResult::Ok(value),
-        Err(err) => type_error(vm, &err),
+        // 访问器 getter 抛出的异常原值传播（ReturnIfAbrupt）。
+        Err(err) => NativeResult::Err(from_engine_error(vm, &err)),
     }
 }
 
@@ -200,7 +228,8 @@ pub fn reflect_is_extensible<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult
 /// `Reflect.ownKeys(target)`：返回对象全部自身属性键，字符串键在前、Symbol 键在后。
 ///
 /// # 步骤
-/// 1. 收集字符串键与整数键（整数升序，其余插入序）。
+/// 1. 收集字符串键与整数键（整数升序，其余插入序）；数组目标注入虚拟
+///    `length`（字符串组首）。
 /// 2. 追加自身 Symbol 键（保持插入序），符合 OrdinaryOwnPropertyKeys 的排序。
 ///
 /// # 副作用
@@ -214,7 +243,15 @@ pub fn reflect_own_keys<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 
     // Symbol 键分流在消费端追加：底层字符串枚举源（Object.keys / JSON / for-in）
     // 语义不变，不泄漏 Symbol 键。
-    let keys = walk_own_keys(vm, target);
+    let mut keys = walk_own_keys(vm, target);
+    // 数组 length 是虚拟自身属性（无 shape 槽、不在形状链）：注入字符串组首
+    // （创建序第一枚字符串键），存储下标哨兵 u32::MAX = 无槽位（消费端只读
+    // si，不读存储下标）。
+    if target.is_array() {
+        let length_si = vm.kernel_core().perm_interner().intern("length").0;
+        let insert_at = keys.iter().position(|(si, _)| !is_int_key(*si)).unwrap_or(keys.len());
+        keys.insert(insert_at, (length_si, u32::MAX));
+    }
     let symbols = own_symbol_key_values(vm, target);
     let n = keys.len() + symbols.len();
 
@@ -452,10 +489,4 @@ fn is_callable(value: JsValue) -> bool {
 
 fn type_error<H: VmHost>(vm: &mut H, message: &str) -> NativeResult {
     NativeResult::Err(crate::error::create_type_error(vm, message))
-}
-
-fn array_like_elements(value: JsValue) -> Option<Vec<JsValue>> {
-    let ptr = object_ptr(value)?;
-    let obj = unsafe { &*ptr };
-    Some((0..obj.prop_count() as usize).map(|idx| obj.get_prop_at(idx)).collect())
 }

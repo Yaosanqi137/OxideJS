@@ -2073,12 +2073,13 @@ fn ta_reflect_has_subarray_view() {
 
 #[test]
 fn ta_keys_int_index_2pow32_boundary() {
-    // 2^32 边界：2^32-1 为规范数组索引（升序前置），2^32 起为串键（插入序）。
+    // 2^32 边界：2^32-2 为规范数组索引上限（升序前置），2^32-1 起为串键
+    // （创建序）。
     let mut vm = Vm::new();
     let result = eval(
         &mut vm,
-        "(function () { var ks1 = Object.keys({ a: 1, '4294967295': 2 }); \
-           if (ks1.join(',') !== '4294967295,a') return false; \
+        "(function () { var ks1 = Object.keys({ a: 1, '4294967294': 2, '4294967295': 3 }); \
+           if (ks1.join(',') !== '4294967294,a,4294967295') return false; \
            var ks2 = Object.keys({ b: 1, '4294967296': 2 }); \
            return ks2.join(',') === 'b,4294967296'; })()",
     )

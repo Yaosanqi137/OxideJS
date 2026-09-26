@@ -367,3 +367,106 @@ fn construct_direct_new_derived_array_guard() {
     .unwrap();
     assert!(result.as_bool());
 }
+
+// 数组 length 是虚拟自身属性：ownKeys 注入字符串组首（创建序第一枚字符串键）。
+#[test]
+fn reflect_own_keys_array_includes_virtual_length() {
+    let mut vm = Vm::new();
+    let result = eval(
+        &mut vm,
+        "var k1 = Reflect.ownKeys([]); \
+         var k2 = Reflect.ownKeys([,,2]); \
+         var a = []; a.x = 1; var k3 = Reflect.ownKeys(a); \
+         k1.join(',') === 'length' && k2.join(',') === '2,length' && k3.join(',') === 'length,x'",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+}
+
+// array index 上限 2^32-2：4294967294 落索引组（整数升序在前），
+// 4294967295 落字符串组（创建序）。
+#[test]
+fn reflect_own_keys_large_index_boundary() {
+    let mut vm = Vm::new();
+    let result = eval(
+        &mut vm,
+        "var o = { b: 1, a: 2, 4294967294: 3, 4294967295: 4 }; \
+         Reflect.ownKeys(o).join(',')",
+    )
+    .unwrap();
+    assert_eq!(to_str(&vm, result), "4294967294,b,a,4294967295");
+}
+
+// Reflect.get 的 own 与 inherited 访问器异常两臂均原值传播。
+#[test]
+fn reflect_get_propagates_accessor_exception_original_value() {
+    let mut vm = Vm::new();
+    let result = eval(
+        &mut vm,
+        "var boom = { value: 1 }; \
+         var own = { get p() { throw boom; } }; \
+         var caughtOwn; \
+         try { Reflect.get(own, 'p'); caughtOwn = 'none'; } catch (e) { caughtOwn = e; } \
+         var inherited = { q: 1 }; \
+         Object.defineProperty(inherited, 'q', { get() { throw boom; }, configurable: true }); \
+         var sub = Object.create(inherited); \
+         var caughtInh; \
+         try { Reflect.get(sub, 'q'); caughtInh = 'none'; } catch (e) { caughtInh = e; } \
+         caughtOwn === boom && caughtInh === boom",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+}
+
+// apply 的 argumentsList 按 CreateListFromArrayLike 读取：length 经 getter，
+// 逐索引规范 Get；函数对象命名槽（prototype/length/name）不被误读。
+#[test]
+fn reflect_apply_arguments_list_array_like() {
+    let mut vm = Vm::new();
+    let result = eval(
+        &mut vm,
+        "function fn() { return [arguments.length, arguments[0]]; } \
+         var list = Object.create(null); \
+         Object.defineProperty(list, 'length', { get: function() { return 1; } }); \
+         var r = Reflect.apply(fn, null, list); \
+         r[0] === 1 && r[1] === undefined",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+}
+
+// apply 的 length getter 异常原值传播；非对象 argumentsList 抛 TypeError。
+#[test]
+fn reflect_apply_propagates_length_getter_original_value() {
+    let mut vm = Vm::new();
+    let result = eval(
+        &mut vm,
+        "var boom = 'X'; \
+         var list = { get length() { throw boom; } }; \
+         var caught; \
+         try { Reflect.apply(function(){}, null, list); caught = 'none'; } catch (e) { caught = e; } \
+         var thrown; \
+         try { Reflect.apply(function(){}, null, 42); thrown = 'none'; } catch (e) { thrown = (e instanceof TypeError); } \
+         caught === boom && thrown === true",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+}
+
+// defineProperty 描述符字段 getter 抛出的异常原值传播（Reflect 与 Object 两侧同通道）。
+#[test]
+fn define_property_propagates_attribute_getter_original_value() {
+    let mut vm = Vm::new();
+    let result = eval(
+        &mut vm,
+        "var boom = 'X'; \
+         var desc = { get enumerable() { throw boom; } }; \
+         var caught; \
+         try { Reflect.defineProperty({}, 'a', desc); caught = 'none'; } catch (e) { caught = e; } \
+         var caughtObj; \
+         try { Object.defineProperty({}, 'a', desc); caughtObj = 'none'; } catch (e) { caughtObj = e; } \
+         caught === boom && caughtObj === boom",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+}

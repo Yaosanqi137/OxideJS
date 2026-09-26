@@ -11,12 +11,13 @@ use oxide_runtime_api::{NativeResult, VmHost};
 
 use crate::builtins_debug;
 
-/// 判断字符串是否为规范整数索引：非空、无前导零、全数字且值 < 2^32。
+/// 判断字符串是否为规范整数索引：非空、无前导零、全数字且值 <= 2^32-2
+/// （array index 上限，2^32-1 落字符串键组）。
 fn is_integer_index(key: &str) -> bool {
     if key.is_empty() || key.len() > 1 && key.as_bytes()[0] == b'0' {
         return false;
     }
-    key.bytes().all(|b| b.is_ascii_digit()) && key.parse::<u64>().unwrap_or(u64::MAX) < (1u64 << 32)
+    key.bytes().all(|b| b.is_ascii_digit()) && key.parse::<u64>().unwrap_or(u64::MAX) <= (1u64 << 32) - 2
 }
 
 /// 收集对象全部自身属性（数组元素区 + shape 链），按规范顺序排列：整数索引在前
@@ -635,12 +636,17 @@ pub fn object_create<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if proto_val.is_null() {
         let obj = vm.alloc_object(JsObject::new_empty(EMPTY_SHAPE_ID, JsValue::null()));
         if args.len() >= 3 && !vm.reg(args[2]).is_undefined() {
-            if let Err(msg) = define_all_from_properties(vm, obj, vm.reg(args[2])) {
-                // 强转期用户异常原值重抛；define 失败文本按 kind 前缀恢复原类型。
-                if let Some(exc) = vm.take_pending_length_exception() {
-                    return NativeResult::Err(exc);
+            match define_all_from_properties(vm, obj, vm.reg(args[2])) {
+                Ok(()) => {}
+                // 描述符字段读取期用户异常原值重抛。
+                Err(DefineDescFailure::User(exc)) => return NativeResult::Err(exc),
+                Err(DefineDescFailure::Engine(msg)) => {
+                    // 强转期用户异常原值重抛；define 失败文本按 kind 前缀恢复原类型。
+                    if let Some(exc) = vm.take_pending_length_exception() {
+                        return NativeResult::Err(exc);
+                    }
+                    return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
                 }
-                return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
             }
         }
         return NativeResult::Ok(JsValue::from_js_object(obj));
@@ -653,12 +659,17 @@ pub fn object_create<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     }
     let obj = vm.alloc_object(JsObject::new_empty(EMPTY_SHAPE_ID, proto_val));
     if args.len() >= 3 && !vm.reg(args[2]).is_undefined() {
-        if let Err(msg) = define_all_from_properties(vm, obj, vm.reg(args[2])) {
-            // 强转期用户异常原值重抛；define 失败文本按 kind 前缀恢复原类型。
-            if let Some(exc) = vm.take_pending_length_exception() {
-                return NativeResult::Err(exc);
+        match define_all_from_properties(vm, obj, vm.reg(args[2])) {
+            Ok(()) => {}
+            // 描述符字段读取期用户异常原值重抛。
+            Err(DefineDescFailure::User(exc)) => return NativeResult::Err(exc),
+            Err(DefineDescFailure::Engine(msg)) => {
+                // 强转期用户异常原值重抛；define 失败文本按 kind 前缀恢复原类型。
+                if let Some(exc) = vm.take_pending_length_exception() {
+                    return NativeResult::Err(exc);
+                }
+                return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
             }
-            return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
         }
     }
     NativeResult::Ok(JsValue::from_js_object(obj))
@@ -738,6 +749,20 @@ pub fn object_is<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     NativeResult::Ok(JsValue::bool(oxide_runtime_api::same_value(lhs, rhs)))
 }
 
+/// 描述符定义通道的失败原因：`Engine` 为 DefineOwnProperty 失败文本
+/// （kind 前缀约定不变，调用方按既有口径恢复）；`User` 为描述符字段读取期
+/// 用户代码抛出的原始异常值，原值重抛。
+pub(crate) enum DefineDescFailure {
+    Engine(String),
+    User(JsValue),
+}
+
+impl From<JsValue> for DefineDescFailure {
+    fn from(exc: JsValue) -> Self {
+        DefineDescFailure::User(exc)
+    }
+}
+
 /// 按 ToPropertyDescriptor 语义把描述符定义/修改到对象的自身属性上。
 ///
 /// 处理数据（value/writable）与访问器（get/set）两类描述符；描述符字段沿原型
@@ -755,11 +780,15 @@ pub fn object_is<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 ///
 /// # 副作用
 /// - 修改 obj 的 shape 链、属性表与 generation
+///
+/// # 注意事项
+/// - 描述符字段读取期用户代码（accessor getter）抛出的异常经
+///   `DefineDescFailure::User` 原值传播，调用方原值重抛。
 pub(crate) fn define_from_descriptor<H: VmHost>(
     vm: &mut H, obj_ptr: *mut JsObject, key_si: u32, desc_val: JsValue,
-) -> Result<(), String> {
+) -> Result<(), DefineDescFailure> {
     if !desc_val.is_object() {
-        return Err("Property description must be an object".to_string());
+        return Err(DefineDescFailure::Engine("Property description must be an object".to_string()));
     }
 
     let value_si = vm.kernel_core().perm_interner().intern("value").0;
@@ -769,12 +798,13 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
     let enumerable_si = vm.kernel_core().perm_interner().intern("enumerable").0;
     let configurable_si = vm.kernel_core().perm_interner().intern("configurable").0;
 
-    let value_field = own_field(vm, desc_val, value_si);
-    let get_field = own_field(vm, desc_val, get_si);
-    let set_field = own_field(vm, desc_val, set_si);
-    let writable_field = own_field(vm, desc_val, writable_si);
-    let enumerable_field = own_field(vm, desc_val, enumerable_si);
-    let configurable_field = own_field(vm, desc_val, configurable_si);
+    // 六字段按规范序逐个 GetV，读取期异常原值传播（ReturnIfAbrupt）。
+    let value_field = own_field(vm, desc_val, value_si)?;
+    let get_field = own_field(vm, desc_val, get_si)?;
+    let set_field = own_field(vm, desc_val, set_si)?;
+    let writable_field = own_field(vm, desc_val, writable_si)?;
+    let enumerable_field = own_field(vm, desc_val, enumerable_si)?;
+    let configurable_field = own_field(vm, desc_val, configurable_si)?;
 
     // 数组 length 是无 shape 槽的虚拟数据属性：需与普通已有属性一样参与描述符
     // 缺省回填（writable 保持当前值、value 保持当前长度），其当前描述符由元素
@@ -809,15 +839,17 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
     // 与 accessor 的收窄由 define_* 的不可配置守卫承担。
     if unsafe { &*obj_ptr }.is_module_namespace() && !is_symbol_key(key_si) {
         let Some(pos) = existing_pos else {
-            return Err("Cannot define property on module namespace: not an export".to_string());
+            return Err(DefineDescFailure::Engine(
+                "Cannot define property on module namespace: not an export".to_string(),
+            ));
         };
         if writable_field.is_some_and(|w| !oxide_runtime_api::to_boolean(w)) {
-            return Err("Cannot redefine module namespace export".to_string());
+            return Err(DefineDescFailure::Engine("Cannot redefine module namespace export".to_string()));
         }
         if let Some(v) = value_field {
             let obj = unsafe { &*obj_ptr };
             if !oxide_runtime_api::same_value(v, obj.get_prop_at(pos)) {
-                return Err("Cannot redefine module namespace export".to_string());
+                return Err(DefineDescFailure::Engine("Cannot redefine module namespace export".to_string()));
             }
         }
     }
@@ -833,7 +865,9 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
     let has_data = value_field.is_some() || writable_field.is_some();
     let has_accessor = get_field.is_some() || set_field.is_some();
     if has_data && has_accessor {
-        return Err("Invalid property descriptor: cannot mix data and accessor fields".to_string());
+        return Err(DefineDescFailure::Engine(
+            "Invalid property descriptor: cannot mix data and accessor fields".to_string(),
+        ));
     }
 
     let existing_value = if is_array_length {
@@ -861,7 +895,9 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
                 .unwrap_or(JsValue::undefined())
         });
         if (!get.is_undefined() && !is_callable(get)) || (!set.is_undefined() && !is_callable(set)) {
-            return Err("accessor descriptor get/set must be callable or undefined".to_string());
+            return Err(DefineDescFailure::Engine(
+                "accessor descriptor get/set must be callable or undefined".to_string(),
+            ));
         }
         (get, set)
     } else {
@@ -880,19 +916,22 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
                     || enumerable_field.is_some_and(|e| !oxide_runtime_api::to_boolean(e))
                     || configurable_field.is_some_and(|c| !oxide_runtime_api::to_boolean(c))
                 {
-                    return Err(
+                    return Err(DefineDescFailure::Engine(
                         "cannot define property: TypedArray index only accepts a writable, enumerable, configurable data descriptor"
                             .to_string(),
-                    );
+                    ));
                 }
                 let value = value_field.unwrap_or_else(|| {
                     crate::typed_array::typed_array_element_get(vm, unsafe { &*obj_ptr }, index)
                         .unwrap_or(JsValue::undefined())
                 });
-                return crate::typed_array::typed_array_element_define(vm, unsafe { &mut *obj_ptr }, index, value);
+                return crate::typed_array::typed_array_element_define(vm, unsafe { &mut *obj_ptr }, index, value)
+                    .map_err(DefineDescFailure::Engine);
             }
             crate::typed_array::TaIndexGate::NumericInvalid => {
-                return Err("cannot define property: TypedArray index out of range".to_string());
+                return Err(DefineDescFailure::Engine(
+                    "cannot define property: TypedArray index out of range".to_string(),
+                ));
             }
             crate::typed_array::TaIndexGate::Ordinary => {}
         }
@@ -900,7 +939,8 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
 
     let obj = unsafe { &mut *obj_ptr };
     if has_accessor {
-        vm.define_accessor_property(obj, key_si, get, set, PropAttributes::new(false, enumerable, configurable))?;
+        vm.define_accessor_property(obj, key_si, get, set, PropAttributes::new(false, enumerable, configurable))
+            .map_err(DefineDescFailure::Engine)?;
     } else if has_data {
         let value = if has_existing {
             value_field.unwrap_or(existing_value)
@@ -914,7 +954,8 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
         } else {
             writable_field.map(oxide_runtime_api::to_boolean).unwrap_or(false)
         };
-        vm.define_data_property(obj, key_si, value, PropAttributes::new(writable, enumerable, configurable))?;
+        vm.define_data_property(obj, key_si, value, PropAttributes::new(writable, enumerable, configurable))
+            .map_err(DefineDescFailure::Engine)?;
     } else {
         if !has_existing {
             vm.define_data_property(
@@ -922,7 +963,8 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
                 key_si,
                 JsValue::undefined(),
                 PropAttributes::new(false, enumerable, configurable),
-            )?;
+            )
+            .map_err(DefineDescFailure::Engine)?;
             return Ok(());
         }
         let is_accessor = existing_meta.map(|m| m.is_accessor).unwrap_or(false);
@@ -931,9 +973,11 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
         if is_accessor {
             let get = existing_meta.map(|m| m.get).unwrap_or(JsValue::undefined());
             let set = existing_meta.map(|m| m.set).unwrap_or(JsValue::undefined());
-            vm.define_accessor_property(obj, key_si, get, set, attrs)?;
+            vm.define_accessor_property(obj, key_si, get, set, attrs)
+                .map_err(DefineDescFailure::Engine)?;
         } else {
-            vm.define_data_property(obj, key_si, existing_value, attrs)?;
+            vm.define_data_property(obj, key_si, existing_value, attrs)
+                .map_err(DefineDescFailure::Engine)?;
         }
     }
     Ok(())
@@ -956,12 +1000,16 @@ pub(crate) fn define_from_descriptor<H: VmHost>(
 ///
 /// # 副作用
 /// - 修改 target 的 shape 链、属性表与 generation
+///
+/// # 注意事项
+/// - 描述符值读取期（getter）与字段读取期用户代码抛出的异常经
+///   `DefineDescFailure::User` 原值传播，调用方原值重抛。
 fn define_all_from_properties<H: VmHost>(
     vm: &mut H, target_ptr: *mut JsObject, props_val: JsValue,
-) -> Result<(), String> {
+) -> Result<(), DefineDescFailure> {
     // ToObject：原始值装箱；null/undefined 的 TypeError 文本经调用方 kind
     // 前缀恢复后原类型抛出。
-    let props_obj = oxide_runtime_api::to_object(props_val, vm)?;
+    let props_obj = oxide_runtime_api::to_object(props_val, vm).map_err(DefineDescFailure::Engine)?;
     let props_ptr = props_obj.as_js_object_ptr();
     let descriptors: Vec<(u32, JsValue)> = {
         let props = unsafe { &*props_ptr };
@@ -973,7 +1021,9 @@ fn define_all_from_properties<H: VmHost>(
                 let props = unsafe { &*props_ptr };
                 vm.ordinary_get(props, key_si, props_obj).map(|desc_val| (key_si, desc_val))
             })
-            .collect::<Result<Vec<_>, _>>()?
+            // 描述符值 getter 抛出的异常原值传播。
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|msg| DefineDescFailure::User(crate::array::from_engine_error(vm, &msg)))?
     };
     for (key_si, desc_val) in descriptors {
         define_from_descriptor(vm, target_ptr, key_si, desc_val)?;
@@ -1000,13 +1050,18 @@ pub fn object_define_property<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResul
     // 保证与计算属性访问、Reflect.defineProperty 等读键路径一致。
     let si = vm.property_key_si(vm.reg(args[2]));
 
-    if let Err(msg) = define_from_descriptor(vm, obj_ptr, si, vm.reg(args[3])) {
-        // 强转期用户代码（valueOf / Symbol.toPrimitive）抛出的异常值转存专用槽，
-        // 须原值重抛而非改写成引擎 TypeError。
-        if let Some(exc) = vm.take_pending_length_exception() {
-            return NativeResult::Err(exc);
+    match define_from_descriptor(vm, obj_ptr, si, vm.reg(args[3])) {
+        Ok(()) => {}
+        // 描述符字段读取期用户代码（accessor getter）抛出的异常原值重抛。
+        Err(DefineDescFailure::User(exc)) => return NativeResult::Err(exc),
+        Err(DefineDescFailure::Engine(msg)) => {
+            // 强转期用户代码（valueOf / Symbol.toPrimitive）抛出的异常值转存专用槽，
+            // 须原值重抛而非改写成引擎 TypeError。
+            if let Some(exc) = vm.take_pending_length_exception() {
+                return NativeResult::Err(exc);
+            }
+            return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
         }
-        return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
     }
     NativeResult::Ok(obj_val)
 }
@@ -1184,12 +1239,18 @@ pub fn object_get_own_property_descriptors<H: VmHost>(vm: &mut H, args: &[u8]) -
 
 /// 按 ToPropertyDescriptor 语义取描述符字段：沿原型链判存在性，存在时经
 /// ordinary_get 取值（触发 accessor getter，receiver 为描述符对象本身）。
-fn own_field<H: VmHost>(vm: &mut H, desc: JsValue, prop_si: u32) -> Option<JsValue> {
+/// 用户代码（accessor getter）抛出的异常原值传播。
+fn own_field<H: VmHost>(vm: &mut H, desc: JsValue, prop_si: u32) -> Result<Option<JsValue>, JsValue> {
     // ordinary_get 对缺失属性返回 undefined，无法区分"不存在"与"值为
     // undefined"，故先用 resolve_property 沿原型链判 HasProperty。
     let obj = unsafe { &*desc.as_js_object_ptr() };
-    vm.resolve_property(obj, prop_si)?;
-    vm.ordinary_get(obj, prop_si, desc).ok()
+    let Some(_) = vm.resolve_property(obj, prop_si) else {
+        return Ok(None);
+    };
+    match vm.ordinary_get(obj, prop_si, desc) {
+        Ok(v) => Ok(Some(v)),
+        Err(msg) => Err(crate::array::from_engine_error(vm, &msg)),
+    }
 }
 
 fn is_callable(value: JsValue) -> bool {
@@ -1492,13 +1553,18 @@ pub fn object_define_properties<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeRes
         return NativeResult::Err(crate::error::create_type_error(vm, "Object.defineProperties called on non-object"));
     }
     let target_ptr = target_val.as_js_object_ptr();
-    if let Err(msg) = define_all_from_properties(vm, target_ptr, vm.reg(args[2])) {
-        // 与单属性入口一致：强转期用户异常原值重抛，非法 length 以 RangeError
-        // kind 穿透，其余 define 失败投影为 TypeError。
-        if let Some(exc) = vm.take_pending_length_exception() {
-            return NativeResult::Err(exc);
+    match define_all_from_properties(vm, target_ptr, vm.reg(args[2])) {
+        Ok(()) => {}
+        // 与单属性入口一致：描述符字段读取期用户异常原值重抛。
+        Err(DefineDescFailure::User(exc)) => return NativeResult::Err(exc),
+        Err(DefineDescFailure::Engine(msg)) => {
+            // 强转期用户异常原值重抛，非法 length 以 RangeError kind 穿透，
+            // 其余 define 失败投影为 TypeError。
+            if let Some(exc) = vm.take_pending_length_exception() {
+                return NativeResult::Err(exc);
+            }
+            return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
         }
-        return NativeResult::Err(crate::error::create_define_failure(vm, &msg));
     }
     NativeResult::Ok(target_val)
 }
