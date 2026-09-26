@@ -70,6 +70,7 @@ impl Vm {
         for &entry in &self.iters.for_of_iters {
             f(entry.iterator);
             f(entry.last_result);
+            f(entry.fast_value);
         }
         // 微任务队列中的处理器/能力/值都是 GC 根。
         for job in &self.job_queue {
@@ -151,6 +152,7 @@ impl Vm {
         for entry in &mut self.iters.for_of_iters {
             entry.iterator = rewrite(entry.iterator);
             entry.last_result = rewrite(entry.last_result);
+            entry.fast_value = rewrite(entry.fast_value);
         }
         // 微任务队列中的值随 sweep 重写。
         for job in &mut self.job_queue {

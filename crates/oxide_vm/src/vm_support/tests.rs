@@ -853,6 +853,8 @@ fn reset_clears_runtime_state_like_rerun() {
         iterator: JsValue::undefined(),
         last_result: JsValue::undefined(),
         is_async: false,
+        fast: None,
+        fast_value: JsValue::undefined(),
     });
     vm.saved_bytecode_stack.push(Arc::from(vec![oxide_bytecode::opcode::encode(
         oxide_bytecode::opcode::OpCode::HALT,

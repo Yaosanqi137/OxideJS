@@ -641,7 +641,9 @@ impl Vm {
         let iterable = self.regs[a];
         match oxide_builtins::iterator::make_iterator_for_value(self, iterable) {
             Ok(iterator) => {
-                self.iters.push_for_of(iterator, false);
+                // 内置包装器检测：Array/String/TA/Map/Set 走快路径（异步恒慢）。
+                let kind = oxide_builtins::iterator::builtin_iter_kind(self, iterator);
+                self.iters.push_for_of(iterator, false, kind);
                 Ok(())
             }
             Err(err) => {
@@ -659,7 +661,7 @@ impl Vm {
         let iterable = self.regs[a];
         match crate::async_from_sync::make_async_iterator(self, iterable) {
             Ok(iterator) => {
-                self.iters.push_for_of(iterator, true);
+                self.iters.push_for_of(iterator, true, None);
                 Ok(())
             }
             Err(err) => {
@@ -762,6 +764,33 @@ impl Vm {
 
         // 调用 next()/读 done 前清空异常值槽：跨调用残留不得污染本指令的取槽。
         self.last_uncaught_value = None;
+
+        // 快路径：内置包装器（Array/String/TA/Map/Set）直步，跳过 native 调用帧、
+        // 结果对象分配与 done/value 两次读；kind 失配清标志，本迭代回落慢路径。
+        let fast_kind = self.iters.for_of_iters.last().and_then(|e| e.fast);
+        if let Some(kind) = fast_kind {
+            // SAFETY: iterator 刚判定为对象。
+            let iter_obj = unsafe { &mut *iterator.as_js_object_ptr() };
+            let step = oxide_builtins::iterator::builtin_iter_fast_step(self, iter_obj, kind);
+            // 元素 getter / __inner__ 访问器抛出：深度 0 的 raise_call_error 已就地
+            // unwind（跳转 catch），条目已弹出、异常值已入异常通道——直接返回，
+            // 派发循环自 catch 点续行，不得再触碰迭代器栈。
+            if !self.iters.for_of_iters.last().is_some_and(|e| e.iterator == iterator) {
+                return Ok(());
+            }
+            match step {
+                Ok(Some((value, done))) => {
+                    self.iters.for_of_iters.last_mut().unwrap().fast_value = value;
+                    self.regs[rd] = JsValue::bool(!done);
+                }
+                Ok(None) => {
+                    self.iters.for_of_iters.last_mut().unwrap().fast = None;
+                }
+                Err(exc) => return self.throw_for_of_error_value(exc),
+            }
+            return Ok(());
+        }
+
         let iter_obj = unsafe { &*iterator.as_js_object_ptr() };
         let next_si = self.kernel_core.perm_interner().intern("next").0;
         let next_fn = match self.ordinary_get(iter_obj, next_si, iterator) {
@@ -792,6 +821,11 @@ impl Vm {
     pub(crate) fn dispatch_for_of_next(&mut self, rd: usize) -> Result<(), String> {
         vm_trace!("FOR_OF_NEXT rd={}", rd);
         self.last_uncaught_value = None;
+        // 快路径：元素值由前一次 DONE 快步产出，直写寄存器。
+        if self.iters.for_of_iters.last().is_some_and(|e| e.fast.is_some()) {
+            self.regs[rd] = self.iters.for_of_iters.last().unwrap().fast_value;
+            return Ok(());
+        }
         let result = self.iters.last_result();
         if !result.is_object() {
             self.regs[rd] = JsValue::undefined();
@@ -811,11 +845,16 @@ impl Vm {
     /// 重新抛出原始值。按 ECMA-262，next() 抛出时不会经 return() 关闭迭代器——
     /// 先弹出它，使展开时的 IteratorClose 遍历跳过该迭代器。
     fn throw_for_of_error(&mut self, msg: String) -> Result<(), String> {
-        self.iters.pop_for_of();
         let exc = match self.last_uncaught_value.take() {
             Some(v) => v,
             None => oxide_builtins::error::create_from_text(self, &msg),
         };
+        self.throw_for_of_error_value(exc)
+    }
+
+    /// 以指定异常值展开（慢路径文本重建与快路径原值透传共用）。
+    fn throw_for_of_error_value(&mut self, exc: JsValue) -> Result<(), String> {
+        self.iters.pop_for_of();
         self.exception_value = Some(exc);
         self.pending_error_kind = Some(self.thrown_error_kind(exc));
         // 无论取到原值还是重建错误对象，异常必须展开传播，不得静默返回 Ok——
@@ -1234,6 +1273,8 @@ mod tests {
             iterator: JsValue::undefined(),
             last_result: JsValue::undefined(),
             is_async: false,
+            fast: None,
+            fast_value: JsValue::undefined(),
         });
 
         vm.run(&Arc::new(module))

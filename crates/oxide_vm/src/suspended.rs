@@ -194,6 +194,7 @@ impl SuspendedFrame {
         for entry in &self.for_of_iters {
             f(entry.iterator);
             f(entry.last_result);
+            f(entry.fast_value);
         }
         if let Some(it) = self.delegated_iterator {
             f(it);
@@ -248,6 +249,7 @@ impl SuspendedFrame {
         for entry in &mut self.for_of_iters {
             entry.iterator = rewrite(entry.iterator);
             entry.last_result = rewrite(entry.last_result);
+            entry.fast_value = rewrite(entry.fast_value);
         }
         self.delegated_iterator = self.delegated_iterator.map(&mut rewrite);
         self.exception_value = self.exception_value.map(&mut rewrite);
@@ -324,6 +326,8 @@ impl SuspendedFrame {
                     iterator: rewrite(entry.iterator),
                     last_result: rewrite(entry.last_result),
                     is_async: entry.is_async,
+                    fast: entry.fast,
+                    fast_value: rewrite(entry.fast_value),
                 })
                 .collect(),
             delegated_iterator: self.delegated_iterator.map(&mut rewrite),
@@ -413,6 +417,8 @@ mod tests {
             iterator: JsValue::float(6.0),
             last_result: JsValue::float(7.0),
             is_async: false,
+            fast: None,
+            fast_value: JsValue::undefined(),
         });
         frame.delegated_iterator = Some(JsValue::float(8.0));
         frame.saved_bytecode_stack.push(Arc::from(vec![0u32]));

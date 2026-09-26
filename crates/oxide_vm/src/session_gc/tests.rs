@@ -117,6 +117,8 @@ fn gc_roots_contains_registers_frames_and_root_roots() {
         iterator: JsValue::from_js_object(child_session),
         last_result: JsValue::from_js_object(root_session),
         is_async: false,
+        fast: None,
+        fast_value: JsValue::undefined(),
     });
 
     let mut roots = Vec::new();

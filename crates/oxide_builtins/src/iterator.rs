@@ -1693,9 +1693,67 @@ fn str_iter_step(units: &[u16], at: usize) -> (usize, Option<StrIterElem>) {
     (at + 1, Some(StrIterElem::One(u)))
 }
 
-fn next_array_like<H: VmHost>(
+/// 内置包装器的内层值种类：for-of 内置包装器（Array/String/TA/Map/Set）的
+/// 内层类型五判据（与 `next_array_like` 臂分派同判据）。快路径按 kind 直步，
+/// kind 失配时回落慢路径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinIterKind {
+    Array,
+    String,
+    TypedArray,
+    MapEntries,
+    SetValues,
+}
+
+/// 按五判据分类内层值（臂序与 `next_array_like` 一致），非内置类型返回 None。
+fn classify_inner(inner: JsValue) -> Option<BuiltinIterKind> {
+    if is_array_value(inner) {
+        Some(BuiltinIterKind::Array)
+    } else if inner.is_string() {
+        Some(BuiltinIterKind::String)
+    } else if is_typed_array_value(inner) {
+        Some(BuiltinIterKind::TypedArray)
+    } else if is_map_value(inner) {
+        Some(BuiltinIterKind::MapEntries)
+    } else if is_set_value(inner) {
+        Some(BuiltinIterKind::SetValues)
+    } else {
+        None
+    }
+}
+
+/// 检测内置包装器种类：读 `__inner__` 槽后按五判据分类。
+///
+/// # 边界
+/// - 包装器非对象 / `__inner__` 缺失（undefined）/ 非内置类型 → None（调用方走慢路径）。
+///
+/// # 注意事项
+/// - `__inner__` 是用户可观察槽，随时可能被改写；检测结果只是 init 期提示，
+///   快路径每步重读复判（见 `builtin_iter_fast_step`）。
+pub fn builtin_iter_kind<H: VmHost>(vm: &mut H, wrapper: JsValue) -> Option<BuiltinIterKind> {
+    if !wrapper.is_object() {
+        return None;
+    }
+    // SAFETY: wrapper 刚判定为对象。
+    let wrapper_obj = unsafe { &*wrapper.as_js_object_ptr() };
+    let inner_si = vm.kernel_core().perm_interner().intern(INNER_PROP).0;
+    let inner = match vm.ordinary_get(wrapper_obj, inner_si, wrapper) {
+        Ok(inner) if !inner.is_undefined() => inner,
+        _ => return None,
+    };
+    classify_inner(inner)
+}
+
+/// 内置包装器步进核心：按内层类型产出元素值与 done 标志，并把新游标写回
+/// 包装器 `__index__` 槽（用户可观察槽，每步直读直写、不跨步缓存）。
+///
+/// # 返回值
+/// - `Ok(None)`：内层非内置类型（调用方落慢路径）；
+/// - `Ok(Some((value, done)))`：本步元素值与 done 标志；
+/// - `Err`：原始异常值（元素 getter 抛出、TA detach/越界等）。
+fn step_builtin_inner<H: VmHost>(
     vm: &mut H, wrapper: &mut JsObject, inner: JsValue, index_si: u32,
-) -> Result<Option<JsValue>, JsValue> {
+) -> Result<Option<(JsValue, bool)>, JsValue> {
     if is_array_value(inner) {
         let index = current_index(vm, wrapper, index_si);
         let arr = unsafe { &*inner.as_js_object_ptr() };
@@ -1713,9 +1771,9 @@ fn next_array_like<H: VmHost>(
                 }
             };
             vm.set_or_create_prop_value(wrapper, index_si, JsValue::int((index + 1) as i32));
-            return Ok(Some(make_iter_result(vm, value, false)));
+            return Ok(Some((value, false)));
         }
-        return Ok(Some(make_iter_result(vm, JsValue::undefined(), true)));
+        return Ok(Some((JsValue::undefined(), true)));
     }
 
     if inner.is_string() {
@@ -1761,9 +1819,9 @@ fn next_array_like<H: VmHost>(
                 },
                 StrIterElem::Pair(hi, lo) => vm.new_string_units(&[hi, lo]),
             };
-            return Ok(Some(make_iter_result(vm, value, false)));
+            return Ok(Some((value, false)));
         }
-        return Ok(Some(make_iter_result(vm, JsValue::undefined(), true)));
+        return Ok(Some((JsValue::undefined(), true)));
     }
 
     if is_typed_array_value(inner) {
@@ -1779,20 +1837,55 @@ fn next_array_like<H: VmHost>(
                 Err(e) => return Err(crate::error::create_type_error(vm, &e)),
             };
             vm.set_or_create_prop_value(wrapper, index_si, JsValue::int((index + 1) as i32));
-            return Ok(Some(make_iter_result(vm, value, false)));
+            return Ok(Some((value, false)));
         }
-        return Ok(Some(make_iter_result(vm, JsValue::undefined(), true)));
+        return Ok(Some((JsValue::undefined(), true)));
     }
 
     // for-of 循环默认迭代：Map 产出 [key, value] 对，Set 产出值。
     if is_map_value(inner) {
-        return Ok(Some(map_set_step(vm, wrapper, inner, index_si, MapSetMode::MapEntries)));
+        let (value, done) = map_set_step_core(vm, wrapper, inner, index_si, MapSetMode::MapEntries);
+        return Ok(Some((value, done)));
     }
     if is_set_value(inner) {
-        return Ok(Some(map_set_step(vm, wrapper, inner, index_si, MapSetMode::SetValues)));
+        let (value, done) = map_set_step_core(vm, wrapper, inner, index_si, MapSetMode::SetValues);
+        return Ok(Some((value, done)));
     }
 
     Ok(None)
+}
+
+/// 内置包装器步进一步（for-of 快路径入口）：重读 `__inner__` 槽并复判 kind，
+/// 失配 / 缺失 / 非对象时以 `None` 信号回落慢路径（调用方清快标志）。
+///
+/// # 返回值
+/// - `Ok(None)`：kind 失配或 `__inner__` 缺失（非内置包装器）；
+/// - `Ok(Some((value, done)))`：本步元素值与 done 标志；
+/// - `Err`：原始异常值。
+pub fn builtin_iter_fast_step<H: VmHost>(
+    vm: &mut H, wrapper: &mut JsObject, kind: BuiltinIterKind,
+) -> Result<Option<(JsValue, bool)>, JsValue> {
+    let inner_si = vm.kernel_core().perm_interner().intern(INNER_PROP).0;
+    let index_si = vm.kernel_core().perm_interner().intern(INDEX_PROP).0;
+    let inner = match vm.ordinary_get(wrapper, inner_si, JsValue::undefined()) {
+        Ok(inner) if !inner.is_undefined() => inner,
+        _ => return Ok(None),
+    };
+    match classify_inner(inner) {
+        Some(actual) if actual == kind => step_builtin_inner(vm, wrapper, inner, index_si),
+        _ => Ok(None),
+    }
+}
+
+/// 内置包装器的 `next` 步进（慢路径）：步进核心产出元素后包成 `{value, done}`
+/// 结果对象；慢路径行为与抽提前逐位一致。
+fn next_array_like<H: VmHost>(
+    vm: &mut H, wrapper: &mut JsObject, inner: JsValue, index_si: u32,
+) -> Result<Option<JsValue>, JsValue> {
+    match step_builtin_inner(vm, wrapper, inner, index_si)? {
+        Some((value, done)) => Ok(Some(make_iter_result(vm, value, done))),
+        None => Ok(None),
+    }
 }
 
 fn current_index<H: VmHost>(vm: &mut H, wrapper: &JsObject, index_si: u32) -> usize {
@@ -1999,13 +2092,15 @@ impl MapSetMode {
     }
 }
 
-/// 把 Map/Set 迭代器包装器推进一步，按指定模式产出 `{value, done}` 结果。
+/// Map/Set 迭代步进核心：按模式产出元素值与 done 标志，并把新下标写回
+/// 包装器 `__index__` 槽。
+///
 /// 条目存放在集合 native-data 槽中（Map 为槽表：空槽跳过、下标口径为"下一待检槽"；
 /// Set 为插入序表）；(a, b) 对在任意分配之前拷出，使对 native 集合的借用不会
 /// 跨越 `vm` 调用保持。
-fn map_set_step<H: VmHost>(
+fn map_set_step_core<H: VmHost>(
     vm: &mut H, wrapper: &mut JsObject, inner: JsValue, index_si: u32, mode: MapSetMode,
-) -> JsValue {
+) -> (JsValue, bool) {
     let index = current_index(vm, wrapper, index_si);
     let is_map = matches!(mode, MapSetMode::MapEntries | MapSetMode::MapValues | MapSetMode::MapKeys);
     let (entry, next_index): (Option<(JsValue, JsValue)>, usize) = unsafe {
@@ -2056,15 +2151,23 @@ fn map_set_step<H: VmHost>(
                 MapSetMode::MapValues => b,
                 MapSetMode::MapKeys | MapSetMode::SetValues => a,
             };
-            make_iter_result(vm, value, false)
+            (value, false)
         }
         None => {
             // 迭代器已耗尽：把下标推进到永不匹配的哨兵值，使后续 next() 恒返回 done，
             // 即使集合之后又新增元素也不会"复活"。
             vm.set_or_create_prop_value(wrapper, index_si, JsValue::int(i32::MAX));
-            make_iter_result(vm, JsValue::undefined(), true)
+            (JsValue::undefined(), true)
         }
     }
+}
+
+/// 把 Map/Set 迭代器包装器推进一步，按指定模式产出 `{value, done}` 结果。
+fn map_set_step<H: VmHost>(
+    vm: &mut H, wrapper: &mut JsObject, inner: JsValue, index_si: u32, mode: MapSetMode,
+) -> JsValue {
+    let (value, done) = map_set_step_core(vm, wrapper, inner, index_si, mode);
+    make_iter_result(vm, value, done)
 }
 
 /// Map/Set 迭代器 `next`：模式从 wrapper `__mode__` 槽读取后按模式推进。

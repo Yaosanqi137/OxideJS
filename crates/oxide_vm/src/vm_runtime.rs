@@ -828,6 +828,8 @@ mod tests {
             iterator: JsValue::float(8.5),
             last_result: JsValue::float(9.0),
             is_async: false,
+            fast: None,
+            fast_value: JsValue::undefined(),
         });
         vm.spill_stack.push(JsValue::float(10.0));
         vm.save_stack.push(JsValue::float(11.0));
