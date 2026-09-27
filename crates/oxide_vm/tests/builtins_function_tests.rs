@@ -342,3 +342,45 @@ fn bound_function_newtarget_pins() {
     .unwrap();
     assert!(result.as_bool());
 }
+
+#[test]
+fn bound_function_length_name_pins() {
+    let mut vm = Vm::new();
+    // length：非自身 length（原型链 42 泄漏形态）→ 0；自身非 Number → 0；
+    // 自身 Number 经 ToIntegerOrInfinity 减绑定实参数。
+    let result = eval(
+        &mut vm,
+        "function bar() {} Object.setPrototypeOf(bar, {length: 42}); delete bar.length; Function.prototype.bind.call(bar, null, 1).length",
+    )
+    .unwrap();
+    assert_num(result, 0.0);
+    let result = eval(
+        &mut vm,
+        "function t() {} Object.defineProperty(t, 'length', {value: '5'}); t.bind(null, 1).length",
+    )
+    .unwrap();
+    assert_num(result, 0.0);
+    let result = eval(
+        &mut vm,
+        "function t() {} Object.defineProperty(t, 'length', {value: 3.66}); t.bind().length",
+    )
+    .unwrap();
+    assert_num(result, 3.0);
+    let result = eval(
+        &mut vm,
+        "function t() {} Object.defineProperty(t, 'length', {value: Infinity}); t.bind().length",
+    )
+    .unwrap();
+    assert!(result.as_double() == f64::INFINITY);
+    // name：getter 抛错须原值传播；chained 读 bound 包装自身 name。
+    let result = eval(
+        &mut vm,
+        "var threw = false; try { Object.defineProperty(function(){}, 'name', {get: function() { throw new Error('x'); }}).bind(); } catch (e) { threw = e.message === 'x'; } threw",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+    let result = eval(&mut vm, "function target() {} target.bind().name").unwrap();
+    assert_eq!(vm.lookup_str(result).unwrap_or_default(), "bound target");
+    let result = eval(&mut vm, "function target() {} target.bind().bind().name").unwrap();
+    assert_eq!(vm.lookup_str(result).unwrap_or_default(), "bound bound target");
+}

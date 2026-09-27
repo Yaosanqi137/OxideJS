@@ -254,6 +254,10 @@ pub fn function_apply<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 
 /// `Function.prototype.bind(thisArg, ...args)`：返回绑定 this 与前置实参的新包装函数，
 /// 调用时通过 `bind_dispatcher` 把绑定实参拼到调用实参前转发到原目标。非函数目标抛 TypeError。
+///
+/// length = max(0, target.length - 绑定实参数)：仅当 target 自有 length 且为 Number
+/// 时读（传播读，getter 抛错原值传播），否则 0。name = "bound " + target.name
+/// （传播读，非字符串 → 空串）。
 pub fn function_bind<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if args.is_empty() {
         return NativeResult::Err(crate::error::create_type_error(
@@ -298,12 +302,20 @@ pub fn function_bind<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     // 全部 shape 属性（length/name）须先于状态数据定义完成，保证 shape 槽位
     // 与 dense 下标对齐，再 push [target, thisArg, ...boundArgs]。
     unsafe {
-        let wrapper_ref = &mut *wrapper;
+        // length：HasOwnProperty 门（非自身 → 0）+ 传播 Get（getter 抛错原值
+        // 传播）+ Number 类型门（非 Number → 0）。
+        // SAFETY: target_val 上方已校验为非空函数对象指针；读取即时消费，不跨 GC/reset。
         let target_obj = &*target_val.as_js_object_ptr();
-        let target_length = vm
-            .resolve_property(target_obj, length_si)
-            .map(to_integer_or_infinity)
-            .unwrap_or(0.0);
+        let mut target_length = 0.0;
+        if vm.get_own_property_slot(target_obj, length_si).is_some() {
+            let own_length = match vm.ordinary_get(target_obj, length_si, target_val) {
+                Ok(v) => v,
+                Err(e) => return NativeResult::Err(to_string_error_value(vm, &e)),
+            };
+            if own_length.js_type().is_number() {
+                target_length = to_integer_or_infinity(own_length);
+            }
+        }
         // length = max(0, target.length - boundArgs)；target.length 为 +∞ 时保持 +∞。
         let length = if target_length == f64::INFINITY {
             f64::INFINITY
@@ -316,14 +328,20 @@ pub fn function_bind<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         } else {
             JsValue::float(length)
         };
+        // 传播读后重取包装器指针。
+        let wrapper_ref = &mut *wrapper;
         if let Err(e) = vm.define_data_property(wrapper_ref, length_si, length_val, attrs) {
             return NativeResult::Err(crate::error::create_type_error(vm, &e));
         }
-        let target_name = vm
-            .resolve_property(target_obj, name_si)
-            .and_then(|v| vm.lookup_str(v))
-            .unwrap_or_default();
+        // name：传播 Get（getter 抛错原值传播），非字符串 → 空串。
+        let target_obj = &*target_val.as_js_object_ptr();
+        let target_name = match vm.ordinary_get(target_obj, name_si, target_val) {
+            Ok(v) => vm.lookup_str(v).unwrap_or_default(),
+            Err(e) => return NativeResult::Err(to_string_error_value(vm, &e)),
+        };
         let name_val = vm.new_string(&format!("bound {target_name}"));
+        // 传播读后重取包装器指针。
+        let wrapper_ref = &mut *wrapper;
         if let Err(e) = vm.define_data_property(wrapper_ref, name_si, name_val, attrs) {
             return NativeResult::Err(crate::error::create_type_error(vm, &e));
         }
