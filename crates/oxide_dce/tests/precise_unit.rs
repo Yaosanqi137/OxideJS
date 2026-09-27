@@ -31,18 +31,8 @@ fn run_precise(f: &mut IRFunction, after: &[&[u32]], reg_count: usize) {
 #[test]
 fn reuse_killed_dead_write_deleted() {
     let mut f = IRFunction::new();
-    f.insts.push(Inst::new(
-        oxide_bytecode::opcode::OpCode::ADD,
-        Operand::Reg(5),
-        Operand::Reg(1),
-        Operand::Reg(2),
-    ));
-    f.insts.push(Inst::new(
-        oxide_bytecode::opcode::OpCode::ADD,
-        Operand::Reg(5),
-        Operand::Reg(3),
-        Operand::Reg(4),
-    ));
+    f.insts.push(Inst::inst_mov(Operand::Reg(5), Operand::Reg(1)));
+    f.insts.push(Inst::inst_mov(Operand::Reg(5), Operand::Reg(3)));
     f.insts.push(Inst::new(
         oxide_bytecode::opcode::OpCode::RETURN,
         Operand::Reg(5),
@@ -51,7 +41,7 @@ fn reuse_killed_dead_write_deleted() {
     ));
     // inst_live_after = [{3,4}, {5}, {}]：inst0 def 5 在 live_after[0] 无 5（后写杀死）
     run_precise(&mut f, &[&[3, 4], &[5], &[]], 5);
-    assert_eq!(f.insts.len(), 2, "死写（前一个 ADD）应被删");
+    assert_eq!(f.insts.len(), 2, "死写（前一个 MOV）应被删");
 }
 
 /// 局部死 STORE_VAR 删除（四条件全满足）。

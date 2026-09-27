@@ -107,13 +107,12 @@ mod tests {
     use oxide_ir::inst::Inst;
     use oxide_ir::operand::Operand;
 
-    /// 线性死链：LOAD_CONST→ADD→结果丢弃，全删（剩 RETURN）。
+    /// 线性死链：LOAD_CONST→MOV→结果丢弃，全删（剩 RETURN）。
     #[test]
     fn linear_dead_chain_deleted() {
         let mut f = IRFunction::new();
         f.insts.push(Inst::load_const(Operand::Reg(0), 0)); // 0: r0 = const
-        f.insts
-            .push(Inst::new(OpCode::ADD, Operand::Reg(1), Operand::Reg(0), Operand::Reg(0))); // 1: r1 = r0 + r0
+        f.insts.push(Inst::inst_mov(Operand::Reg(1), Operand::Reg(0))); // 1: r1 = r0
         f.insts
             .push(Inst::new(OpCode::RETURN, Operand::Reg(2), Operand::None, Operand::None)); // 2: return r2
         let mut keep = vec![true; f.insts.len()];
@@ -175,13 +174,12 @@ mod tests {
         assert_eq!(keep, vec![false, true], "死 CREATE_CLOSURE 删，RETURN 保留");
     }
 
-    /// 连锁迭代：写链 LOAD_CONST→ADD→LOAD_CONST 全死，逐轮删除至不动点。
+    /// 连锁迭代：写链 LOAD_CONST→MOV→LOAD_CONST 全死，逐轮删除至不动点。
     #[test]
     fn chained_dead_writes_deleted_iteratively() {
         let mut f = IRFunction::new();
-        f.insts.push(Inst::load_const(Operand::Reg(0), 0)); // 0: r0（ADD 读，轮 2 删）
-        f.insts
-            .push(Inst::new(OpCode::ADD, Operand::Reg(1), Operand::Reg(0), Operand::Reg(0))); // 1: r1（轮 1 删）
+        f.insts.push(Inst::load_const(Operand::Reg(0), 0)); // 0: r0（MOV 读，轮 2 删）
+        f.insts.push(Inst::inst_mov(Operand::Reg(1), Operand::Reg(0))); // 1: r1（轮 1 删）
         f.insts.push(Inst::load_const(Operand::Reg(2), 2)); // 2: r2 无人读（轮 1 删）
         f.insts
             .push(Inst::new(OpCode::RETURN, Operand::Reg(5), Operand::None, Operand::None)); // 3

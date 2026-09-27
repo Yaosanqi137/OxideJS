@@ -792,3 +792,12 @@ fn compile_delete_new_instanceof_in() {
     );
     assert!(module.bytecode.iter().any(|&i| opcode::opcode(i) == OpCode::IN), "in should emit IN");
 }
+
+#[test]
+fn compile_nonfinal_relational_comparison_kept() {
+    let module = compile_source("let s = 1; s <= 1; s + 1;");
+    assert!(
+        module.bytecode.iter().any(|&i| opcode::opcode(i) == OpCode::LTE),
+        "非末语句形 s <= 1 应保留 LTE 指令（结果虽未用，ToPrimitive 副作用不可删）"
+    );
+}

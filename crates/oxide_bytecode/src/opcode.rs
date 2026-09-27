@@ -159,22 +159,22 @@ define_opcodes! {
     // ── Arithmetic (0x00-0x0F) ──
     ADD = 0x00 => "ADD",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     SUB = 0x01 => "SUB",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     MUL = 0x02 => "MUL",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     DIV = 0x03 => "DIV",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     MOD = 0x04 => "MOD",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     NEG = 0x05 => "NEG",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     COMPOUND_ADD = 0x06 => "COMPOUND_ADD",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::Rd), SlotSpec::Slot(Slot::A)],
         pure = false, jump = false, term = false, ic = false,
@@ -196,7 +196,7 @@ define_opcodes! {
     // 二元幂运算 `a ** b`（三寄存器，与 SUB/MUL 同族；0x00-0x0F 已满，值用空闲槽 0x94）。
     EXP = 0x94 => "EXP",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     MOV = 0x0C => "MOV", // rd=dst, a=src（寄存器复制，区间拆分搬值）
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A)],
         pure = true, jump = false, term = false, ic = false,
@@ -213,22 +213,22 @@ define_opcodes! {
     // ── 比较 (0x10-0x1F) ──
     EQ = 0x10 => "EQ",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     NEQ = 0x11 => "NEQ",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     LT = 0x12 => "LT",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     GT = 0x13 => "GT",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     LTE = 0x14 => "LTE",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     GTE = 0x15 => "GTE",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     IN = 0x16 => "IN",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
         pure = false, jump = false, term = false, ic = false,
@@ -249,7 +249,7 @@ define_opcodes! {
         pure = true, jump = false, term = false, ic = false,
     UNARY_PLUS = 0x1D => "UNARY_PLUS",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
 
     // ── 控制流 (0x1E-0x2F) ──
     BREAK = 0x1E => "BREAK",
@@ -330,7 +330,7 @@ define_opcodes! {
     // ── 模板字符串 (0x38) ──
     TEMPLATE_STR = 0x38 => "TEMPLATE_STR",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::TemplateExprs],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
 
     // ── 标签模板对象 (0x97) ──
     // GetTemplateObject：按 site 缓存模板对象（同一编译树同 site 恒返回同一对象），
@@ -473,10 +473,10 @@ define_opcodes! {
         pure = false, jump = false, term = false, ic = false,
     // 多操作数拼接（连续 `+` 左结合链摊平）：rd=结果，a=首操作数，ext=[n, op2..opn]，
     // n=操作数总数，ext 字数 = 1+(n-1) = n；op 字无高位标记（纯 vreg，≤255），
-    // SpreadArgs 直接解析。与 ADD 同标纯（含 ToPrimitive 副作用仍静态可删，语义同 ADD）。
+    // SpreadArgs 直接解析。含 ToPrimitive 副作用，不可删。
     CONCAT_N = 0x93 => "CONCAT_N",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::SpreadArgs],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
 
     // ── 成员更新 (0x59-0x62) ──
     MEMBER_INC = 0x59 => "MEMBER_INC", // 结果写 a 槽（val 槽原地更新）
@@ -668,25 +668,25 @@ define_opcodes! {
     // ── 位运算 (0x80-0x8F) ──
     BIT_AND = 0x80 => "BIT_AND",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     BIT_OR = 0x81 => "BIT_OR",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     BIT_XOR = 0x82 => "BIT_XOR",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     SHL = 0x83 => "SHL",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     SHR = 0x84 => "SHR",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     USHR = 0x85 => "USHR",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A), SlotSpec::Slot(Slot::B)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     BIT_NOT = 0x86 => "BIT_NOT",
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::A)],
-        pure = true, jump = false, term = false, ic = false,
+        pure = false, jump = false, term = false, ic = false,
     TO_OBJECT = 0x87 => "TO_OBJECT", // rd 原地转换（读且写）
         def = Some(SlotSpec::Slot(Slot::Rd)), uses = [SlotSpec::Slot(Slot::Rd)],
         pure = false, jump = false, term = false, ic = false,

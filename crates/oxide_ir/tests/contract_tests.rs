@@ -252,16 +252,8 @@ fn regalloc_opcodes_def_use_contract() {
 #[test]
 fn pure_ops_are_deletable() {
     let f = IRFunction::new();
-    // 算术 / 比较 / 位 / 逻辑
-    assert!(Inst::new(OpCode::ADD, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
-    assert!(Inst::new(OpCode::SUB, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
-    assert!(Inst::new(OpCode::MUL, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
-    assert!(Inst::new(OpCode::NEG, Operand::Reg(0), Operand::Reg(1), Operand::None).is_pure(&f));
-    assert!(Inst::new(OpCode::EQ, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    // 逻辑 / 严格相等（不抛，纯）
     assert!(Inst::new(OpCode::STRICT_EQ, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
-    assert!(Inst::new(OpCode::LT, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
-    assert!(Inst::new(OpCode::BIT_AND, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
-    assert!(Inst::new(OpCode::BIT_NOT, Operand::Reg(0), Operand::Reg(1), Operand::None).is_pure(&f));
     assert!(Inst::new(OpCode::AND, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
     assert!(Inst::new(OpCode::OR, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
     assert!(Inst::new(OpCode::NOT, Operand::Reg(0), Operand::Reg(1), Operand::None).is_pure(&f));
@@ -277,8 +269,6 @@ fn pure_ops_are_deletable() {
     assert!(Inst::create_closure(Operand::Reg(1), 0).is_pure(&f));
     assert!(Inst::new(OpCode::LOAD_UPVALUE, Operand::Reg(1), Operand::Imm(0), Operand::None).is_pure(&f));
     assert!(Inst::new(OpCode::CELL_GET, Operand::Reg(0), Operand::Reg(1), Operand::Imm(0)).is_pure(&f));
-    // 模板字符串
-    assert!(Inst::template_str(Operand::Reg(1), 1, 10, &[0x1234]).is_pure(&f));
     // RegAlloc 辅助：MOV 纯
     assert!(Inst::inst_mov(Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
     // LOAD_VAR 普通（a=Reg）纯
@@ -292,6 +282,16 @@ fn pure_ops_are_deletable() {
 #[test]
 fn impure_ops_are_not_deletable() {
     let f = IRFunction::new();
+    // 算术 / 比较 / 位 / 模板字符串（ToNumber/ToPrimitive 可抛，不可删）
+    assert!(!Inst::new(OpCode::ADD, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    assert!(!Inst::new(OpCode::SUB, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    assert!(!Inst::new(OpCode::MUL, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    assert!(!Inst::new(OpCode::NEG, Operand::Reg(0), Operand::Reg(1), Operand::None).is_pure(&f));
+    assert!(!Inst::new(OpCode::EQ, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    assert!(!Inst::new(OpCode::LT, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    assert!(!Inst::new(OpCode::BIT_AND, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
+    assert!(!Inst::new(OpCode::BIT_NOT, Operand::Reg(0), Operand::Reg(1), Operand::None).is_pure(&f));
+    assert!(!Inst::template_str(Operand::Reg(1), 1, 10, &[0x1234]).is_pure(&f));
     // getter / 写对象属性
     assert!(!Inst::ic_get(Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
     assert!(!Inst::new(OpCode::GET_PROP, Operand::Reg(0), Operand::Reg(1), Operand::Reg(2)).is_pure(&f));
@@ -440,7 +440,14 @@ fn assert_group(ops: &[OpCode], def: Option<u32>, uses: &[u32], pure: bool) {
 /// 每个 opcode 的 def/use/pure 与现有语义表一致（canonical rd=1, a=2, b=3）。
 #[test]
 fn opcode_semantics_golden_table() {
-    // 二元运算：def=rd, uses=[a,b]，纯
+    // 二元运算：def=rd, uses=[a,b]，纯（逻辑/严格相等不抛）
+    assert_group(
+        &[OpCode::AND, OpCode::OR, OpCode::STRICT_EQ, OpCode::STRICT_NEQ, OpCode::NULLISH],
+        Some(1),
+        &[2, 3],
+        true,
+    );
+    // 二元但不可删：ToNumber/ToPrimitive 可抛，或 coerce 有观察路径
     assert_group(
         &[
             OpCode::ADD,
@@ -454,31 +461,24 @@ fn opcode_semantics_golden_table() {
             OpCode::GT,
             OpCode::LTE,
             OpCode::GTE,
-            OpCode::AND,
-            OpCode::OR,
-            OpCode::STRICT_EQ,
-            OpCode::STRICT_NEQ,
             OpCode::BIT_AND,
             OpCode::BIT_OR,
             OpCode::BIT_XOR,
             OpCode::SHL,
             OpCode::SHR,
             OpCode::USHR,
-            OpCode::NULLISH,
+            OpCode::IN,
+            OpCode::INSTANCEOF,
+            OpCode::CREATE_REGEXP,
         ],
         Some(1),
         &[2, 3],
-        true,
+        false,
     );
-    // 二元但不可删：coerce 有观察路径
-    assert_group(&[OpCode::IN, OpCode::INSTANCEOF, OpCode::CREATE_REGEXP], Some(1), &[2, 3], false);
-    // 一元：def=rd, uses=[a]
-    assert_group(
-        &[OpCode::NEG, OpCode::NOT, OpCode::UNARY_PLUS, OpCode::BIT_NOT, OpCode::TYPEOF],
-        Some(1),
-        &[2],
-        true,
-    );
+    // 一元：def=rd, uses=[a]，纯（NOT/TYPEOF 不抛）
+    assert_group(&[OpCode::NOT, OpCode::TYPEOF], Some(1), &[2], true);
+    // 一元但不可删：ToNumber/ToPrimitive 可抛
+    assert_group(&[OpCode::NEG, OpCode::UNARY_PLUS, OpCode::BIT_NOT], Some(1), &[2], false);
     // 复合赋值：def=rd, uses=[rd,a]，不可删
     assert_group(
         &[
@@ -551,10 +551,10 @@ fn opcode_semantics_golden_table() {
     assert_contract(OpCode::THROW, None, &[1], false);
     assert_contract(OpCode::RETURN, None, &[1], false);
     assert_contract(OpCode::HALT, None, &[0], false);
-    // 模板字符串：表达式寄存器来自 ext
-    assert_contract(OpCode::TEMPLATE_STR, Some(1), &[5], true);
-    // 多操作数拼接：a 槽首操作数 + ext[1..] 后续操作数（SpreadArgs 解析）
-    assert_contract(OpCode::CONCAT_N, Some(1), &[2, 5, 9], true);
+    // 模板字符串：表达式寄存器来自 ext；ToPrimitive 可抛，不可删
+    assert_contract(OpCode::TEMPLATE_STR, Some(1), &[5], false);
+    // 多操作数拼接：a 槽首操作数 + ext[1..] 后续操作数（SpreadArgs 解析）；ToPrimitive 可抛，不可删
+    assert_contract(OpCode::CONCAT_N, Some(1), &[2, 5, 9], false);
     // 小语言特性
     assert_contract(OpCode::DELETE_PROP_STATIC, None, &[1], false);
     assert_contract(OpCode::DELETE_PROP_DYNAMIC, None, &[1, 3], false);
