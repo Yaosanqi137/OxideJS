@@ -533,6 +533,18 @@ impl Vm {
             frame.return_addr,
             frame.caller_reg_limit
         );
+        // 调用返回：sloppy 函数在 dispatch_create_arguments 把 own arguments 属性
+        // 设为本调用的 arguments 对象；返回后须清空（置 undefined），否则强引用
+        // 保活最后一次调用的 arguments 对象，跨 epoch 晋升后泄漏。仅当属性在场时
+        // 清空（strict 函数无 own arguments，避免误建）。
+        if !frame.strict && frame.callee.is_object() {
+            let arguments_si = self.kernel_core.perm_interner().intern("arguments").0;
+            let callee_ref = unsafe { &*frame.callee.as_js_object_ptr() };
+            if let Some(slot) = self.get_own_property_slot(callee_ref, arguments_si) {
+                let callee_mut = unsafe { &mut *frame.callee.as_js_object_ptr() };
+                callee_mut.set_prop_at(slot, JsValue::undefined());
+            }
+        }
         // 弹帧后 callee 换回调用方：失效 upvalue 切片缓存。
         self.upvalue_cache = None;
         if let Some(saved_bc) = self.saved_bytecode_stack.pop() {
