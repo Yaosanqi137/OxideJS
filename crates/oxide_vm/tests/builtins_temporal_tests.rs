@@ -2629,6 +2629,33 @@ fn duration_total_relative_zdt() {
     assert_eq!(r.as_double(), 1.0);
 }
 
+#[test]
+fn duration_round_weighted_sum_range_boundary() {
+    let mut vm = Vm::new();
+    // round 纯时间路径范围判据按存储分量加权和（spec IsValidDuration），非逐分量：
+    // 输入 2^53 s − 30 s 合法，expand 舍到 minute 后 2^53 s + 28 s 越界 → RangeError
+    // （平衡后各分量均低于上限）；负镜像同抛；2^53 s − 1 ns 输入舍到 day 得
+    // 104249991374 天（2^53 s − 27392 s）→ 接受。
+    let r = eval(
+        &mut vm,
+        "(() => {
+           const kind = (fn) => { try { fn(); return 'no'; } catch (e) { return e.constructor.name; } };
+           return [
+             kind(() => new Temporal.Duration(0, 0, 0, 104249991374, 7, 36, 2)
+                .round({ smallestUnit: 'minute', roundingMode: 'expand' })),
+             kind(() => new Temporal.Duration(0, 0, 0, -104249991374, -7, -36, -2)
+                .round({ smallestUnit: 'minute', roundingMode: 'expand' })),
+             kind(() => new Temporal.Duration(0, 0, 0, 104249991374, 7, 36, 31, 999, 999, 999)
+                .round({ smallestUnit: 'day' })),
+             new Temporal.Duration(0, 0, 0, 104249991374, 7, 36, 31, 999, 999, 999)
+                .round({ smallestUnit: 'day' }).toString(),
+           ].join('|');
+         })()",
+    )
+    .unwrap();
+    assert_eq!(str_val(&vm, r), "RangeError|RangeError|no|P104249991374D");
+}
+
 // -- Temporal.PlainMonthDay / PlainYearMonth（E 批）--
 
 #[test]

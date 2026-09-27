@@ -306,7 +306,9 @@ fn duration_relative_to_date<H: VmHost>(
         if let Ok((year, month, day, _time_ns)) = parse_plain_date_time_string(&text) {
             return Ok(Some((i128::from(year), i128::from(month), i128::from(day))));
         }
-        // ZonedDateTime-like（含 Z 或时区注解）：按 instant 解析 + 注解时区反推墙钟日期。
+        // 回退支：plain 首支解析失败的串（含 Z 的串或非法注解）。命名区当前全部 RangeError
+        // （canonical_time_zone 拒 IANA），可解析的带注解串已被 plain 首支接受。
+        // 按 instant 解析 + 注解时区反推墙钟日期。
         let (epoch_ns, time_zone_id, _calendar) = zoned_date_time_string_parts(vm, &text, "reject")?;
         let offset_minutes = instant_time_zone_offset(&time_zone_id).unwrap_or(0);
         let wall_ns = epoch_ns + i128::from(offset_minutes) * 60_000_000_000;
@@ -651,7 +653,7 @@ pub fn duration_add<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 /// 4. 平衡后存储时间分量（含 days，𝔽 舍入）的纳秒加权和校验 2^53 秒上限。
 ///
 /// # 边界与前提
-/// - 任一侧含日历单位抛 RangeError（本批无 relativeTo 支持）。
+/// - add/subtract 无 relativeTo 选项，任一侧含 years/months/weeks 即抛 RangeError。
 /// - 全零与 nanosecond 分量和为 0 时直接返回零时长。
 fn add_duration_values<H: VmHost>(vm: &mut H, receiver: &[f64; 10], other: &[f64; 10]) -> Result<[f64; 10], JsValue> {
     if receiver[..3].iter().any(|value| *value != 0.0) || other[..3].iter().any(|value| *value != 0.0) {
@@ -1088,24 +1090,15 @@ pub fn duration_round<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
                 unit -= 1;
             }
         }
-        // 范围校验：对每个时间分量按纳秒刻度检查是否达到 2^53 秒上限。
-        const MAX_TIME_NANOSECONDS: f64 = (1_i128 << 53) as f64 * 1_000_000_000.0;
-        const UNIT_SCALES: [f64; 7] = [
-            86_400_000_000_000.0,
-            3_600_000_000_000.0,
-            60_000_000_000.0,
-            1_000_000_000.0,
-            1_000_000.0,
-            1_000.0,
-            1.0,
-        ];
-        for (index, scale) in (3..10).zip(UNIT_SCALES) {
-            if result[index] != 0.0 && result[index].abs() * scale >= MAX_TIME_NANOSECONDS {
-                return NativeResult::Err(crate::error::create_range_error(
-                    vm,
-                    "duration time fields are out of range",
-                ));
-            }
+        // 范围校验：判据作用在存储分量（平衡后 𝔽 舍入结果）的纳秒加权和上，与
+        // add/subtract 同式；加权和覆盖逐分量检查的盲区（总和落在 [2^53 s, 2^53 s +
+        // 86400 s) 而各分量均低于上限的缝隙带）。
+        const MAX_TIME_NANOSECONDS: i128 = (1_i128 << 53) * 1_000_000_000;
+        let Some(stored_ns) = duration_time_nanoseconds(&result) else {
+            return NativeResult::Err(crate::error::create_range_error(vm, "invalid duration"));
+        };
+        if stored_ns.abs() >= MAX_TIME_NANOSECONDS {
+            return NativeResult::Err(crate::error::create_range_error(vm, "duration time fields are out of range"));
         }
         return make_duration(vm, result);
     }
