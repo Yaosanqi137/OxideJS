@@ -239,6 +239,48 @@ fn for_await_of_return_escape_defers_async_close() {
     );
 }
 
+#[test]
+fn for_await_of_close_return_getter_throw_propagates_original() {
+    // 收尾时 return 的 getter 抛出：外围 catch 须收到原始抛出值，
+    // 不得是重建的 Error 对象。
+    assert_eq!(
+        eval(
+            "let caught;\
+             const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},get return(){throw 'ret-getter';}}}};\
+             (async()=>{ try { for await (const x of it) { break; } } catch (e) { caught = e; } return 'caught:' + caught; })()"
+        ),
+        "\"caught:ret-getter\""
+    );
+}
+
+#[test]
+fn for_await_of_close_return_call_throw_propagates_original() {
+    // 收尾时 return() 调用抛出：外围 catch 须收到原始抛出值。
+    assert_eq!(
+        eval(
+            "let caught;\
+             const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},return(){throw 'ret-call';}}}};\
+             (async()=>{ try { for await (const x of it) { break; } } catch (e) { caught = e; } return 'caught:' + caught; })()"
+        ),
+        "\"caught:ret-call\""
+    );
+}
+
+#[test]
+fn for_await_of_close_throw_object_identity_preserved() {
+    // 收尾时 return() 抛出对象：外围 catch 收到的须是同一对象（身份保留），
+    // 证明原始异常值经异常通道传播而非按文本重建。
+    assert_eq!(
+        eval(
+            "let caught;\
+             const marker={tag:'x'};\
+             const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},return(){throw marker;}}}};\
+             (async()=>{ try { for await (const x of it) { break; } } catch (e) { caught = e; } return caught === marker ? 'same' : 'diff:' + caught; })()"
+        ),
+        "\"same\""
+    );
+}
+
 // ── class/object 生成器方法（异步） ──
 
 // class async 生成器方法：yield 顺序与 done 收敛。顶层 then 链驱动

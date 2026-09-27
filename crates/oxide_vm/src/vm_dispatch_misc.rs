@@ -739,14 +739,22 @@ impl Vm {
         }
         let iter_obj = unsafe { &*iterator.as_js_object_ptr() };
         let return_si = self.kernel_core.perm_interner().intern("return").0;
-        let return_fn = self.ordinary_get(iter_obj, return_si, iterator)?;
+        let return_fn = match self.ordinary_get(iter_obj, return_si, iterator) {
+            Ok(v) => v,
+            // return getter 抛出：恢复原始异常值并就地展开，使外围 try/catch 可捕获。
+            Err(e) => return self.throw_for_of_close_error(&e),
+        };
         if !return_fn.is_object() {
             return Ok(());
         }
         if !unsafe { &*return_fn.as_js_object_ptr() }.is_function() {
             return Ok(());
         }
-        let inner = self.call_function_sync(return_fn, iterator, &[])?;
+        let inner = match self.call_function_sync(return_fn, iterator, &[]) {
+            Ok(v) => v,
+            // return() 抛出：恢复原始异常值并就地展开，使外围 try/catch 可捕获。
+            Err(e) => return self.throw_for_of_close_error(&e),
+        };
         if !inner.is_object() {
             return self.raise_type_error("iterator return() result is not an object");
         }
@@ -859,6 +867,23 @@ impl Vm {
         self.pending_error_kind = Some(self.thrown_error_kind(exc));
         // 无论取到原值还是重建错误对象，异常必须展开传播，不得静默返回 Ok——
         // 否则 for-of 循环继续推进形成不终止。
+        self.unwind()
+    }
+
+    /// for-await-of 收尾抛错（return getter 或 return() 调用）：恢复原始异常值并就地
+    /// 展开，使外围 try/catch 可捕获。本函数入口已弹出本迭代器条目，故展开路径不得
+    /// 再弹 for-of 栈（与 throw_for_of_error_value 的唯一区别）。
+    ///
+    /// 直接 unwind 而非经 raise_call_error：后者以 native_call_depth 门控展开，
+    /// 异步函数恢复期深度恒大于零会误判为不展开，使异常绕过循环内 catch 直接
+    /// 拒绝 capability promise。
+    fn throw_for_of_close_error(&mut self, msg: &str) -> Result<(), String> {
+        let exc = self
+            .last_uncaught_value
+            .take()
+            .unwrap_or_else(|| oxide_builtins::error::create_from_text(self, msg));
+        self.exception_value = Some(exc);
+        self.pending_error_kind = Some(self.thrown_error_kind(exc));
         self.unwind()
     }
 
