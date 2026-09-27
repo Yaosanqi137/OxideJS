@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use oxide_compiler::compiler::Compiler;
+use oxide_runtime_api::VmHost;
 use oxide_types::value::JsValue;
 use oxide_vm::vm::Vm;
 
@@ -58,6 +59,33 @@ fn replacer_function_transform() {
     assert_eq!(stringify_val(&result), r#"{"a":2}"#);
 }
 
+// --- 顶层 replacer 序（replacer 先于 undefined/函数/Symbol 早返）---
+
+// 顶层 undefined：replacer 先被调用，返回值即序列化结果。
+#[test]
+fn stringify_top_level_undefined_replacer_first() {
+    let out = eval_str("JSON.stringify(undefined, (k,v) => 42)").unwrap();
+    assert_eq!(out, "42");
+}
+
+// 顶层函数/Symbol：replacer 可替换为可序列化值。
+#[test]
+fn stringify_top_level_fn_symbol_replacer() {
+    let out = eval_str("JSON.stringify(function(){}, (k,v) => 'x')").unwrap();
+    assert_eq!(out, r#""x""#);
+    let out = eval_str("JSON.stringify(Symbol(), (k,v) => 'y')").unwrap();
+    assert_eq!(out, r#""y""#);
+}
+
+// 顶层 undefined 无 replacer / replacer 透传：仍 undefined（守卫）。
+#[test]
+fn stringify_top_level_undefined_still_undefined() {
+    let (_vm, result) = eval("JSON.stringify(undefined, (k,v) => v)").unwrap();
+    assert!(result.is_undefined());
+    let (_vm, result) = eval("JSON.stringify(undefined)").unwrap();
+    assert!(result.is_undefined());
+}
+
 // --- space ---
 
 #[test]
@@ -72,6 +100,66 @@ fn space_number_indent() {
 fn space_negative_clamped() {
     let (_vm, result) = eval(r#"JSON.stringify({a:1}, null, -5)"#).unwrap();
     assert_eq!(stringify_val(&result), r#"{"a":1}"#);
+}
+
+// space = +∞ → 10 空格 gap（ToIntegerOrInfinity 后 min(10, x)）。
+#[test]
+fn stringify_space_infinity_ten_spaces() {
+    let out = eval_str("JSON.stringify({a:1}, null, Infinity)").unwrap();
+    assert_eq!(out, "{\n          \"a\": 1\n}");
+}
+
+// space = −∞/NaN → 空 gap。
+#[test]
+fn stringify_space_neg_inf_nan_empty() {
+    let out = eval_str("JSON.stringify({a:1}, null, -Infinity)").unwrap();
+    assert_eq!(out, r#"{"a":1}"#);
+    let out = eval_str("JSON.stringify({a:1}, null, NaN)").unwrap();
+    assert_eq!(out, r#"{"a":1}"#);
+}
+
+// space 小数截断（2.5 → 2 空格）、12 钳 10。
+#[test]
+fn stringify_space_fractional_and_clamp() {
+    let out = eval_str("JSON.stringify({a:1}, null, 2.5)").unwrap();
+    assert_eq!(out, "{\n  \"a\": 1\n}");
+    let out = eval_str("JSON.stringify({a:1}, null, 12)").unwrap();
+    assert_eq!(out, "{\n          \"a\": 1\n}");
+}
+
+// 装箱 Number space：ToNumber 后与素形同语义（+∞ → 10、−∞ → 空）。
+#[test]
+fn stringify_space_boxed_number() {
+    let out = eval_str("JSON.stringify({a:1}, null, new Number(Infinity))").unwrap();
+    assert_eq!(out, "{\n          \"a\": 1\n}");
+    let out = eval_str("JSON.stringify({a:1}, null, new Number(-Infinity))").unwrap();
+    assert_eq!(out, r#"{"a":1}"#);
+}
+
+// space 字符串 astral：按前 10 码元截断（12 码元 → 5 对，非标量值 6 口径）。
+#[test]
+fn stringify_space_astral_truncated_units() {
+    let out = eval_str("JSON.stringify([1], null, '😀😀😀😀😀😀')").unwrap();
+    assert_eq!(out, "[\n😀😀😀😀😀1\n]");
+}
+
+// 装箱 String space：同款码元口径。
+#[test]
+fn stringify_space_astral_boxed_string() {
+    let out = eval_str("JSON.stringify([1], null, new String('😀😀😀😀😀😀'))").unwrap();
+    assert_eq!(out, "[\n😀😀😀😀😀1\n]");
+}
+
+// 截断落在代理对边界：gap 保留原始孤立 surrogate（node 口径，非 \u 转义）。
+#[test]
+fn stringify_space_astral_lone_surrogate() {
+    let (vm, result) =
+        eval("JSON.stringify([1], null, '\\uD83D\\uD83D\\uD83D\\uD83D\\uD83D\\uD83D\\uD83D\\uD83D')").unwrap();
+    let units = vm.string_units(result);
+    let expected: Vec<u16> = vec![
+        0x5B, 0x0A, 0xD83D, 0xD83D, 0xD83D, 0xD83D, 0xD83D, 0xD83D, 0xD83D, 0xD83D, 0x31, 0x0A, 0x5D,
+    ];
+    assert_eq!(units.as_ref(), expected.as_slice());
 }
 
 // --- toJSON ---

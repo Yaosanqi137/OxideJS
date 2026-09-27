@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fmt::Write;
 
 use oxide_kernel::shape_forge::EMPTY_SHAPE_ID;
 use oxide_types::object::{JsObject, PropAttributes};
@@ -703,21 +702,18 @@ fn create_wrapper<H: VmHost>(vm: &mut H, value: JsValue) -> JsValue {
 }
 
 /// space 参数文本化（Stringify 步 5）：数字与装箱 Number 经 ToNumber →
-/// ToIntegerOrInfinity 钳 10；字符串与装箱 String 取前 10 字符（装箱 String
-/// 走完整 ToString，步 4c 同款语义，抛出值原样上抛）；其余形态（装箱 Boolean、
-/// 普通对象、Symbol 等）gap 为空串。
-fn process_space<H: VmHost>(vm: &mut H, val: JsValue) -> Result<String, JsValue> {
+/// ToIntegerOrInfinity 后 min(10, x) 个空格（+∞ → 10、−∞/NaN → 空）；字符串与
+/// 装箱 String 取前 10 码元（码元口径，astral 字符可截在代理对边界，截断产物
+/// 保留孤立 surrogate；装箱 String 走完整 ToString，步 4c 同款语义，抛出值原样
+/// 上抛）；其余形态（装箱 Boolean、普通对象、Symbol 等）gap 为空。
+fn process_space<H: VmHost>(vm: &mut H, val: JsValue) -> Result<Vec<u16>, JsValue> {
     if val.is_int() || val.is_double() {
         let n = oxide_runtime_api::to_integer_or_infinity(val);
-        if n.is_nan() || n.is_infinite() || n <= 0.0 {
-            return Ok(String::new());
-        }
-        let clamped = (n as usize).min(10);
-        return Ok(" ".repeat(clamped));
+        return Ok(number_space_units(n));
     }
     if val.is_string() {
-        let s = unsafe { (*val.as_string_ptr()).to_owned_string() };
-        return Ok(s.chars().take(10).collect());
+        let units = vm.string_units(val);
+        return Ok(units.iter().take(10).copied().collect());
     }
     if val.is_object() {
         let ptr = val.as_js_object_ptr();
@@ -735,11 +731,7 @@ fn process_space<H: VmHost>(vm: &mut H, val: JsValue) -> Result<String, JsValue>
                     }
                 };
                 let n = oxide_runtime_api::to_integer_or_infinity(JsValue::float(n));
-                if n.is_nan() || n.is_infinite() || n <= 0.0 {
-                    return Ok(String::new());
-                }
-                let clamped = (n as usize).min(10);
-                return Ok(" ".repeat(clamped));
+                return Ok(number_space_units(n));
             }
             // [[StringData]]：完整 ToString。
             if obj.is_string_obj() {
@@ -751,12 +743,23 @@ fn process_space<H: VmHost>(vm: &mut H, val: JsValue) -> Result<String, JsValue>
                             .unwrap_or_else(|| crate::error::create_type_error(vm, &msg)));
                     }
                 };
-                let s = unsafe { (*s.as_string_ptr()).to_owned_string() };
-                return Ok(s.chars().take(10).collect());
+                let units = vm.string_units(s);
+                return Ok(units.iter().take(10).copied().collect());
             }
         }
     }
-    Ok(String::new())
+    Ok(Vec::new())
+}
+
+/// 数字 space → min(10, ToIntegerOrInfinity(space)) 个空格码元：+∞ → 10、
+/// −∞/NaN/小于 1 → 空。
+fn number_space_units(n: f64) -> Vec<u16> {
+    let m = n.min(10.0);
+    if m.is_nan() || m < 1.0 {
+        Vec::new()
+    } else {
+        vec![0x20; m as usize]
+    }
 }
 
 /// 键 si 物化为单元序列：整数键 → ASCII 数字串，字符串键 → 码表键经 `decode_key`
@@ -895,14 +898,13 @@ fn read_json_property_value<H: VmHost>(
 
 /// `JSON.stringify(value, replacer, space)`：将 JS 值序列化为 JSON 文本。
 /// 支持 replacer 函数/属性白名单、toJSON 钩子、缩进与循环引用检测。
+/// 顶层值序为 Get → toJSON → replacer，undefined/函数/Symbol 早返在 replacer
+/// 之后（replacer 可替换早返形态）。
 pub fn json_stringify<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if args.len() < 2 {
         return NativeResult::Ok(JsValue::undefined());
     }
     let value = vm.reg(args[1]);
-    if value.is_undefined() {
-        return NativeResult::Ok(JsValue::undefined());
-    }
 
     let mut replacer_fn: Option<JsValue> = None;
     let mut replacer_whitelist: Option<Vec<String>> = None;
@@ -942,7 +944,7 @@ pub fn json_stringify<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
             Err(exc) => return NativeResult::Err(exc),
         }
     } else {
-        String::new()
+        Vec::new()
     };
 
     let holder = create_wrapper(vm, value);
@@ -967,7 +969,8 @@ pub fn json_stringify<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         value
     };
 
-    // 顶层省略值：undefined、函数、Symbol 一律返回 undefined（非空串）。
+    // 顶层省略值：replacer 之后的 undefined、函数、Symbol 一律返回 undefined
+    // （非空串）——replacer 先于本判定应用（SerializeJSONProperty 步 3 先于步 8/10）。
     let top_is_fn = value.is_object() && {
         let p = value.as_js_object_ptr();
         !p.is_null() && unsafe { (*p).is_function() }
@@ -977,7 +980,7 @@ pub fn json_stringify<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     }
 
     let mut visited = HashSet::new();
-    let mut output = String::new();
+    let mut output: Vec<u16> = Vec::new();
     let indent_level: usize = 0;
     match jsvalue_to_json(
         vm,
@@ -989,7 +992,7 @@ pub fn json_stringify<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
         &space,
         indent_level,
     ) {
-        Ok(()) => NativeResult::Ok(vm.new_string_owned(output)),
+        Ok(()) => NativeResult::Ok(vm.new_string_units_owned(output)),
         Err(exc) => NativeResult::Err(exc),
     }
 }
@@ -1000,24 +1003,24 @@ pub fn json_stringify<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
 /// 符合规范。`Err` 携带的原始异常值（含环检 TypeError）原样上抛。
 #[allow(clippy::too_many_arguments)]
 fn jsvalue_to_json<H: VmHost>(
-    vm: &mut H, val: JsValue, visited: &mut HashSet<*const JsObject>, out: &mut String, replacer_fn: Option<JsValue>,
-    replacer_whitelist: Option<&Vec<String>>, space: &str, indent_level: usize,
+    vm: &mut H, val: JsValue, visited: &mut HashSet<*const JsObject>, out: &mut Vec<u16>, replacer_fn: Option<JsValue>,
+    replacer_whitelist: Option<&Vec<String>>, space: &[u16], indent_level: usize,
 ) -> Result<(), JsValue> {
     if val.is_null() {
-        out.push_str("null");
+        push_ascii(out, "null");
     } else if val.is_undefined() {
     } else if val.is_symbol() {
-        out.push_str("null");
+        push_ascii(out, "null");
     } else if val.is_bool() {
-        out.push_str(if val.as_bool() { "true" } else { "false" });
+        push_ascii(out, if val.as_bool() { "true" } else { "false" });
     } else if val.is_int() {
-        let _ = write!(out, "{}", val.as_int());
+        push_ascii(out, &val.as_int().to_string());
     } else if val.is_double() {
         let n = val.as_double();
         if !n.is_finite() {
-            out.push_str("null");
+            push_ascii(out, "null");
         } else {
-            oxide_runtime_api::write_number_into(n, out);
+            push_number(out, n);
         }
     } else if val.is_bigint() {
         // SerializeJSONProperty 步 10：BigInt 无 JSON 文本形态，抛 TypeError。
@@ -1029,7 +1032,7 @@ fn jsvalue_to_json<H: VmHost>(
     } else if val.is_object() {
         let obj_ptr = val.as_js_object_ptr();
         if obj_ptr.is_null() {
-            out.push_str("null");
+            push_ascii(out, "null");
             return Ok(());
         }
 
@@ -1041,7 +1044,7 @@ fn jsvalue_to_json<H: VmHost>(
                 let raw_val = obj.get_prop_at(0);
                 // SAFETY: rawJSON 属性构造期即写入字符串值。
                 let raw_text = unsafe { (*raw_val.as_string_ptr()).to_owned_string() };
-                out.push_str(&raw_text);
+                push_ascii(out, &raw_text);
                 return Ok(());
             }
         }
@@ -1064,9 +1067,9 @@ fn jsvalue_to_json<H: VmHost>(
                 }
             };
             if n.is_finite() {
-                oxide_runtime_api::write_number_into(n, out);
+                push_number(out, n);
             } else {
-                out.push_str("null");
+                push_ascii(out, "null");
             }
             visited.remove(&(obj_ptr as *const JsObject));
             return Ok(());
@@ -1074,7 +1077,7 @@ fn jsvalue_to_json<H: VmHost>(
         // 步 4b：装箱 Boolean → [[BooleanData]]。
         if obj.is_boolean_obj() {
             let b = obj.boxed_value();
-            out.push_str(if b.is_bool() && b.as_bool() { "true" } else { "false" });
+            push_ascii(out, if b.is_bool() && b.as_bool() { "true" } else { "false" });
             visited.remove(&(obj_ptr as *const JsObject));
             return Ok(());
         }
@@ -1110,51 +1113,57 @@ fn jsvalue_to_json<H: VmHost>(
     Ok(())
 }
 
+/// 追加 ASCII 字面量到单元流（JSON 结构字符与转义序列恒为 ASCII）。
+fn push_ascii(out: &mut Vec<u16>, s: &str) {
+    out.extend(s.encode_utf16());
+}
+
+/// 追加数字规范文本到单元流（write_number_into 输出恒为 ASCII）。
+fn push_number(out: &mut Vec<u16>, n: f64) {
+    let mut s = String::new();
+    oxide_runtime_api::write_number_into(n, &mut s);
+    push_ascii(out, &s);
+}
+
 /// JSON 字符串序列化（按码单元流）：代理对原样输出 astral 字符，非配对孤立
-/// surrogate 输出 \uXXXX（well-formed JSON 要求，round-trip 经 JSON.parse 复原同值），
-/// C0/C1 控制码输出 \uXXXX，其余按 JSON 转义规则。
-fn stringify_string_units(units: &[u16], out: &mut String) {
-    out.push('"');
+/// surrogate 输出 \uXXXX（well-formed JSON 要求，round-trip 经 JSON.parse 复原
+/// 同值），C0/C1 控制码输出 \uXXXX，其余按 JSON 转义规则。
+fn stringify_string_units(units: &[u16], out: &mut Vec<u16>) {
+    push_ascii(out, "\"");
     let mut i = 0;
     while i < units.len() {
         let u = units[i];
         if (0xD800..=0xDBFF).contains(&u) && i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
-            let cp = 0x10000 + ((u32::from(u) - 0xD800) << 10) + (u32::from(units[i + 1]) - 0xDC00);
-            if let Some(c) = char::from_u32(cp) {
-                out.push(c);
-            }
+            out.push(u);
+            out.push(units[i + 1]);
             i += 2;
             continue;
         }
         match u {
-            0x22 => out.push_str("\\\""),
-            0x5C => out.push_str("\\\\"),
-            0x08 => out.push_str("\\b"),
-            0x0C => out.push_str("\\f"),
-            0x0A => out.push_str("\\n"),
-            0x0D => out.push_str("\\r"),
-            0x09 => out.push_str("\\t"),
+            0x22 => push_ascii(out, "\\\""),
+            0x5C => push_ascii(out, "\\"),
+            0x08 => push_ascii(out, "\\b"),
+            0x0C => push_ascii(out, "\\f"),
+            0x0A => push_ascii(out, "\\n"),
+            0x0D => push_ascii(out, "\\r"),
+            0x09 => push_ascii(out, "\\t"),
             0x00..=0x1F | 0x7F..=0x9F | 0xD800..=0xDFFF => {
-                let _ = write!(out, "\\u{:04x}", u);
+                push_ascii(out, &format!("\\u{:04x}", u));
             }
-            _ => {
-                if let Some(c) = char::from_u32(u32::from(u)) {
-                    out.push(c);
-                }
-            }
+            _ => out.push(u),
         }
         i += 1;
     }
-    out.push('"');
+    push_ascii(out, "\"");
 }
 
 #[allow(clippy::too_many_arguments)]
 fn stringify_object<H: VmHost>(
-    vm: &mut H, obj: &JsObject, visited: &mut HashSet<*const JsObject>, out: &mut String, replacer_fn: Option<JsValue>,
-    replacer_whitelist: Option<&Vec<String>>, space: &str, indent_level: usize,
+    vm: &mut H, obj: &JsObject, visited: &mut HashSet<*const JsObject>, out: &mut Vec<u16>,
+    replacer_fn: Option<JsValue>, replacer_whitelist: Option<&Vec<String>>, space: &[u16], indent_level: usize,
 ) -> Result<(), JsValue> {
     let has_space = !space.is_empty();
-    out.push('{');
+    push_ascii(out, "{");
 
     // 键集：白名单给定时 K = P（列表序，不限自身可枚举，值读走 Get）；
     // 无白名单走自身可枚举序（EnumerableOwnPropertyNames）。
@@ -1222,55 +1231,55 @@ fn stringify_object<H: VmHost>(
         }
 
         if !first {
-            out.push(',');
+            push_ascii(out, ",");
         }
         first = false;
 
         if has_space {
-            out.push('\n');
+            push_ascii(out, "\n");
             for _ in 0..indent_level + 1 {
-                out.push_str(space);
+                out.extend_from_slice(space);
             }
             stringify_string_units(&units, out);
-            out.push(':');
-            out.push(' ');
+            push_ascii(out, ":");
+            push_ascii(out, " ");
         } else {
             stringify_string_units(&units, out);
-            out.push(':');
+            push_ascii(out, ":");
         }
 
         jsvalue_to_json(vm, val, visited, out, replacer_fn, replacer_whitelist, space, indent_level + 1)?;
     }
 
     if has_space && !first {
-        out.push('\n');
+        push_ascii(out, "\n");
         for _ in 0..indent_level {
-            out.push_str(space);
+            out.extend_from_slice(space);
         }
     }
-    out.push('}');
+    push_ascii(out, "}");
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn stringify_array<H: VmHost>(
-    vm: &mut H, obj: &JsObject, visited: &mut HashSet<*const JsObject>, out: &mut String, replacer_fn: Option<JsValue>,
-    replacer_whitelist: Option<&Vec<String>>, space: &str, indent_level: usize,
+    vm: &mut H, obj: &JsObject, visited: &mut HashSet<*const JsObject>, out: &mut Vec<u16>,
+    replacer_fn: Option<JsValue>, replacer_whitelist: Option<&Vec<String>>, space: &[u16], indent_level: usize,
 ) -> Result<(), JsValue> {
     let has_space = !space.is_empty();
-    out.push('[');
+    push_ascii(out, "[");
 
     let obj_val = JsValue::from_js_object(obj as *const JsObject as *mut JsObject);
     let len = obj.prop_count() as usize;
     for i in 0..len {
         if i > 0 {
-            out.push(',');
+            push_ascii(out, ",");
         }
 
         if has_space {
-            out.push('\n');
+            push_ascii(out, "\n");
             for _ in 0..indent_level + 1 {
-                out.push_str(space);
+                out.extend_from_slice(space);
             }
         }
 
@@ -1287,7 +1296,7 @@ fn stringify_array<H: VmHost>(
             match vm.call_function_sync(replacer, obj_val, &[key_val, val]) {
                 Ok(v) => {
                     if v.is_undefined() {
-                        out.push_str("null");
+                        push_ascii(out, "null");
                         continue;
                     }
                     v
@@ -1308,19 +1317,19 @@ fn stringify_array<H: VmHost>(
             !ptr.is_null() && unsafe { (*ptr).is_function() }
         };
         if is_function || val.is_undefined() {
-            out.push_str("null");
+            push_ascii(out, "null");
         } else {
             jsvalue_to_json(vm, val, visited, out, replacer_fn, replacer_whitelist, space, indent_level + 1)?;
         }
     }
 
     if has_space && len > 0 {
-        out.push('\n');
+        push_ascii(out, "\n");
         for _ in 0..indent_level {
-            out.push_str(space);
+            out.extend_from_slice(space);
         }
     }
-    out.push(']');
+    push_ascii(out, "]");
     Ok(())
 }
 
@@ -1328,15 +1337,15 @@ fn stringify_array<H: VmHost>(
 /// 逐元素按对象臂规范序 Get → toJSON → replacer 处理，输出形态与普通对象一致。
 #[allow(clippy::too_many_arguments)]
 fn stringify_typed_array<H: VmHost>(
-    vm: &mut H, obj: &JsObject, visited: &mut HashSet<*const JsObject>, out: &mut String, replacer_fn: Option<JsValue>,
-    replacer_whitelist: Option<&Vec<String>>, space: &str, indent_level: usize,
+    vm: &mut H, obj: &JsObject, visited: &mut HashSet<*const JsObject>, out: &mut Vec<u16>,
+    replacer_fn: Option<JsValue>, replacer_whitelist: Option<&Vec<String>>, space: &[u16], indent_level: usize,
 ) -> Result<(), JsValue> {
     let has_space = !space.is_empty();
     let this_val = JsValue::from_js_object(obj as *const JsObject as *mut JsObject);
     let view = crate::typed_array::get_typed_array_data(vm, this_val)?;
     // live 口径：buffer 收缩/detach 后按当前 live 长度枚举（detached 空对象形态）。
     let len = crate::typed_array::ta_live_length(view);
-    out.push('{');
+    push_ascii(out, "{");
 
     // 键集：白名单给定时 K = P（列表序，整数索引名读元素、越界名跳过、
     // 非索引名经 Get 读命名键如 length）；无白名单走升序元素序。
@@ -1401,32 +1410,32 @@ fn stringify_typed_array<H: VmHost>(
         }
 
         if !first {
-            out.push(',');
+            push_ascii(out, ",");
         }
         first = false;
 
         if has_space {
-            out.push('\n');
+            push_ascii(out, "\n");
             for _ in 0..indent_level + 1 {
-                out.push_str(space);
+                out.extend_from_slice(space);
             }
             stringify_string_units(&index_units, out);
-            out.push(':');
-            out.push(' ');
+            push_ascii(out, ":");
+            push_ascii(out, " ");
         } else {
             stringify_string_units(&index_units, out);
-            out.push(':');
+            push_ascii(out, ":");
         }
 
         jsvalue_to_json(vm, val, visited, out, replacer_fn, replacer_whitelist, space, indent_level + 1)?;
     }
 
     if has_space && !first {
-        out.push('\n');
+        push_ascii(out, "\n");
         for _ in 0..indent_level {
-            out.push_str(space);
+            out.extend_from_slice(space);
         }
     }
-    out.push('}');
+    push_ascii(out, "}");
     Ok(())
 }
