@@ -250,6 +250,13 @@ pub(super) fn build(
     for &v in &node_ids {
         adj_sets.entry(v).or_default();
     }
+    // fresh 按 at（活点指令下标）预分组：逐指令查 fresh 由 O(fresh) 降为 O(1)，
+    // 避免 O(inst × fresh) 全扫描（长活 vreg 被 spill 时 fresh 可达指令数量级）。
+    // 同 at 的 id 保持插入序，逐指令并入顺序与原线性扫描逐字节一致（确定性不漂移）。
+    let mut fresh_by_at: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+    for fr in fresh {
+        fresh_by_at.entry(fr.at).or_default().push(fr.id);
+    }
     for i in 0..inst_count {
         // 只遍历该指令活集中置位的 vreg（u64 位集逐字 trailing_zeros 升序），
         // 替代逐 node 全扫描——活集小（典型 2-4）时每指令从 O(nodes) 降到 O(live)。
@@ -267,10 +274,8 @@ pub(super) fn build(
                 bits &= bits - 1;
             }
         }
-        for fr in fresh {
-            if fr.at == i {
-                at_i.push(fr.id);
-            }
+        if let Some(ids) = fresh_by_at.get(&i) {
+            at_i.extend_from_slice(ids);
         }
         // 两两加边（基于 live_before：约束 use/def 与执行前存活值）
         for a in 0..at_i.len() {
