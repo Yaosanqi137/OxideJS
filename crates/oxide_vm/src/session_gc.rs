@@ -7,6 +7,7 @@ use oxide_types::object::{Cell, JsObject, JsString, PropMetaEntry};
 use oxide_types::value::JsValue;
 use rustc_hash::FxBuildHasher;
 
+use crate::native_box_dispatch;
 use crate::vm::Vm;
 use oxide_builtins::{array_buffer, data_view, disposable_stack, map, module, regexp, set, typed_array, weak_map};
 
@@ -177,87 +178,23 @@ impl SessionGc {
         Self::process_edge(obj.captured_this(), vm, stack, live_strings, live_bigints);
         Self::process_edge(obj.home_object(), vm, stack, live_strings, live_bigints);
         Self::process_edge(obj.boxed_value(), vm, stack, live_strings, live_bigints);
-        if obj.is_map() {
-            for value in map::map_native_edges(obj) {
+        // native 载荷家族边：单点分类 + 家族表函数引用驱动，
+        // 替代逐族 is_* 谓词链（各家族边函数引用见 native_box_dispatch）。
+        let ops = native_box_dispatch::ops_for(native_box_dispatch::classify(obj));
+        if let Some(object_edges) = ops.object_edges {
+            for value in object_edges(obj) {
                 Self::process_edge(value, vm, stack, live_strings, live_bigints);
             }
         }
-        if obj.is_set() {
-            for value in set::set_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-        }
-        if obj.is_weak_map_obj() {
-            // 仅值边进 mark（强边）；键为弱边，不入栈不置位。
-            for value in weak_map::weak_map_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-        }
-        if obj.is_disposable_stack_obj() || obj.is_async_disposable_stack_obj() {
-            for value in disposable_stack::dispose_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-        }
-        if obj.is_typed_array_obj() {
-            for value in typed_array::typed_array_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-        }
-        if obj.is_data_view_obj() {
-            for value in data_view::data_view_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-        }
-        if obj.is_module_namespace() {
-            for value in module::module_ns_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-            for ptr in module::module_ns_cell_edges(obj) {
-                live_cells.insert(ptr);
-            }
-        }
-        if obj.is_generator_obj() {
-            for value in crate::generator::generator_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-            for ptr in crate::generator::generator_native_string_edges(obj) {
+        if let Some(string_edges) = ops.string_edges {
+            for ptr in string_edges(obj) {
                 Self::mark_string_live(live_strings, ptr);
             }
-            for ptr in crate::generator::generator_native_cell_edges(obj) {
+        }
+        if let Some(cell_edges) = ops.cell_edges {
+            for ptr in cell_edges(obj) {
                 live_cells.insert(ptr);
             }
-        }
-        if obj.is_promise_obj() {
-            for value in crate::promise::promise_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-        }
-        if obj.is_async_obj() {
-            for value in crate::async_func::async_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-            for ptr in crate::async_func::async_native_string_edges(obj) {
-                Self::mark_string_live(live_strings, ptr);
-            }
-            for ptr in crate::async_func::async_native_cell_edges(obj) {
-                live_cells.insert(ptr);
-            }
-        }
-        if obj.is_async_generator_obj() {
-            for value in crate::async_generator::async_generator_native_edges(obj) {
-                Self::process_edge(value, vm, stack, live_strings, live_bigints);
-            }
-            for ptr in crate::async_generator::async_generator_native_string_edges(obj) {
-                Self::mark_string_live(live_strings, ptr);
-            }
-            for ptr in crate::async_generator::async_generator_native_cell_edges(obj) {
-                live_cells.insert(ptr);
-            }
-        }
-        // RegExp 实例 source/flags 字段持有字符串边。
-        if obj.is_regexp_obj() {
-            Self::process_edge(obj.get_regexp_source(), vm, stack, live_strings, live_bigints);
-            Self::process_edge(obj.get_regexp_flags(), vm, stack, live_strings, live_bigints);
         }
         // 遍历 upvalue cell 中的引用：cell 指针本身入存活集（对象 upvalues 边
         // 是 cell 的根面），值边照常走 process_edge。

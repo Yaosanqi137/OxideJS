@@ -19,6 +19,8 @@ mod generator;
 mod ic_helper;
 /// native 函数签名类型（[`native::NativeFn`]），builtin 绑定与 VM 调用约定依赖它。
 pub mod native;
+/// native 载荷家族单点分类与每家族边函数引用（家族表，GC 各链注册面）。
+mod native_box_dispatch;
 /// Promise 运行时（状态盒 + 微任务队列 + 构造器/方法实现）。
 pub mod promise;
 mod session_arena;
