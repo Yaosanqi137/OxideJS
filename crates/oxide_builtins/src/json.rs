@@ -1141,7 +1141,7 @@ fn stringify_string_units(units: &[u16], out: &mut Vec<u16>) {
         }
         match u {
             0x22 => push_ascii(out, "\\\""),
-            0x5C => push_ascii(out, "\\"),
+            0x5C => push_ascii(out, "\\\\"),
             0x08 => push_ascii(out, "\\b"),
             0x0C => push_ascii(out, "\\f"),
             0x0A => push_ascii(out, "\\n"),
