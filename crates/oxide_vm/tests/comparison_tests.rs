@@ -157,3 +157,27 @@ fn eval_string_relational_utf16_code_unit_order() {
         assert_eq!(eval(source), expected, "source: {source}");
     }
 }
+
+#[test]
+fn eval_relational_symbol_throws() {
+    // 关系比较任一侧为 Symbol 时按 ToNumber 抛 TypeError（规范 13.7.5 步骤 4/5）。
+    assert_eq!(
+        eval("Object(Symbol()) <= ''"),
+        "vm error: uncaught TypeError: Cannot convert a Symbol value to a number"
+    );
+    // symbol 与 bigint 混合时 symbol 消息优先（ToNumber 先于混合判定）。
+    assert_eq!(
+        eval("Object(Symbol()) < 1n"),
+        "vm error: uncaught TypeError: Cannot convert a Symbol value to a number"
+    );
+    assert_eq!(
+        eval("Object(Symbol()) > 1n"),
+        "vm error: uncaught TypeError: Cannot convert a Symbol value to a number"
+    );
+    assert_eq!(
+        eval("1n >= Object(Symbol())"),
+        "vm error: uncaught TypeError: Cannot convert a Symbol value to a number"
+    );
+    // 松散等值对 symbol 不抛，返回 false（回归钉）。
+    assert_eq!(eval("Object(Symbol()) == 'Symbol()'"), "false");
+}
