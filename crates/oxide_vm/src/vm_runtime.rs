@@ -485,13 +485,16 @@ impl Vm {
             self.regs[sub.param_base as usize + i] = args.get(i).copied().unwrap_or(JsValue::undefined());
         }
         // this 绑定：箭头函数恒用词法捕获；sloppy 普通函数 this 为 null/undefined 时
-        // 替换为全局对象（ECMA-262 10.4.3）；严格模式与显式 receiver 原样保留。
+        // 替换为全局对象，其余原始值经 ToObject 盒装（ECMA-262 10.4.3）；严格模式
+        // this 原样保留。
         self.regs[254] = if sub.is_arrow {
             callee_obj.captured_this()
         } else if !sub.is_strict && receiver.is_nullish() {
             JsValue::from_js_object(self.session.global_object().as_ptr() as *mut JsObject)
-        } else {
+        } else if sub.is_strict {
             receiver
+        } else {
+            oxide_runtime_api::to_object(receiver, self)?
         };
         self.regs[255] = JsValue::undefined();
         self.reload_builtin_mirror_slots(&sub.builtin_reg_map, 0);

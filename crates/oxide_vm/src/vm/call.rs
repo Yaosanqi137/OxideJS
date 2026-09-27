@@ -273,13 +273,16 @@ impl Vm {
             self.regs[sub_param_base + i] = v;
         }
         // this 绑定：箭头函数恒用词法捕获；sloppy 普通函数 this 为 null/undefined 时
-        // 替换为全局对象（ECMA-262 10.4.3）；严格模式与显式方法/构造 this 原样保留。
+        // 替换为全局对象，其余原始值经 ToObject 盒装（ECMA-262 10.4.3）；严格模式
+        // this 原样保留。
         self.regs[254] = if sub_is_arrow {
             obj.captured_this()
         } else if !sub_is_strict && this_value.is_nullish() {
             JsValue::from_js_object(self.session.global_object().as_ptr() as *mut JsObject)
-        } else {
+        } else if sub_is_strict {
             this_value
+        } else {
+            oxide_runtime_api::to_object(this_value, self)?
         };
         self.regs[255] = new_target;
 

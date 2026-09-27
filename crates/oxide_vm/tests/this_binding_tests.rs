@@ -1,5 +1,6 @@
 //! sloppy 普通函数 `this` 绑定语义测试：非箭头 && 非 strict && this 为 null/undefined
-//! 时替换为全局对象；箭头/严格/method/构造/显式 receiver 均不替换。
+//! 时替换为全局对象，其余原始值经 ToObject 盒装；箭头/严格/method/构造/显式
+//! receiver 均不替换。
 //! 覆盖普通调用、call/apply/bind、builtin 回调、构造、生成器、async、derived 构造。
 
 use std::sync::Arc;
@@ -117,6 +118,23 @@ fn explicit_object_receiver_not_replaced() {
 fn strict_call_with_nullish_keeps_undefined() {
     let mut vm = Vm::new();
     assert_true(&mut vm, "function f(){ 'use strict'; return this === undefined; } f.call(undefined)");
+}
+
+#[test]
+fn call_with_primitive_this_boxes_object() {
+    // sloppy 普通函数 call 原始值 this 经 ToObject 盒装为对应包装对象。
+    let mut vm = Vm::new();
+    assert_true(&mut vm, "function f(){ return typeof this === 'object'; } f.call('str')");
+    assert_true(&mut vm, "function f(){ return typeof this === 'object'; } f.call(1)");
+    assert_true(&mut vm, "function f(){ return typeof this === 'object'; } f.call(true)");
+    assert_true(&mut vm, "function f(){ return typeof this === 'object'; } f.call(1n)");
+}
+
+#[test]
+fn strict_call_with_primitive_this_keeps_primitive() {
+    // strict 函数 call 原始值 this 原样保留，不盒装。
+    let mut vm = Vm::new();
+    assert_true(&mut vm, "function f(){ 'use strict'; return typeof this === 'string'; } f.call('str')");
 }
 
 // ── builtin 回调 / 生成器 / async ──
