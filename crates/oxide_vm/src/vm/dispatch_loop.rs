@@ -830,7 +830,8 @@ impl Vm {
                 OpCode::YIELD_STAR => {
                     // `yield*` 委托：取内层迭代器并推进一步。
                     // 未 done → 挂起让出（存委托迭代器）；done → 委托完成值写 reg 0 继续外层；
-                    // unwind 捕获到异常 → 继续 dispatch（已展开到 catch/finally）。
+                    // unwind 捕获到异常 → 继续 dispatch（已展开到 catch/finally）；
+                    // 异步委托 → 内层迭代已登记微任务队列，内嵌 dispatch 返回。
                     match self.dispatch_yield_star(rd)? {
                         crate::generator::YieldStarOutcome::Suspend(value) => {
                             self.generator_suspended = Some(value);
@@ -841,6 +842,10 @@ impl Vm {
                             self.regs[0] = value;
                         }
                         crate::generator::YieldStarOutcome::Unwind => {}
+                        crate::generator::YieldStarOutcome::AsyncSuspend => {
+                            self.profiling.set_instruction_count(steps);
+                            return Ok(JsValue::undefined());
+                        }
                     }
                 }
 

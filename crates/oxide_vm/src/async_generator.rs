@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 
-use oxide_builtins::iterator::make_iter_result;
+use oxide_builtins::iterator::{is_callable, make_iter_result};
 use oxide_kernel::shape_forge::EMPTY_SHAPE_ID;
 use oxide_runtime_api::{NativeResult, VmHost};
 use oxide_types::object::{Cell, JsObject, NativeFnPtr, PropAttributes};
@@ -46,6 +46,19 @@ pub(crate) struct AsyncGenRequest {
     pub reject: JsValue,
 }
 
+/// `yield*` 委托协议步（异步生成器）：内层 next/return/throw 的 promise 结算后，
+/// 步进取续闭包按步推进协议状态机。纯枚举（零 JsValue 字段，零 GC 面）：
+/// 结算值经反应实参传递，跨微任务存活由 job 队列 GC 根保证。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DelegateStep {
+    /// 等内层 next(v) 或 throw(e) 的 promise 结算（两者结算逻辑同构）。
+    Inner,
+    /// 等内层 return(v) 的 promise 结算（外层 return 请求）。
+    Return,
+    /// 等内层 return()（close）的 promise 结算（外层 throw 请求，内层无 throw 方法）。
+    Close,
+}
+
 /// 异步生成器挂起时的完整执行上下文快照 + 请求队列。
 ///
 /// 存在异步生成器对象 `native_data`（`Box`），跨 next()/微任务存活；其中所有
@@ -64,6 +77,8 @@ pub(crate) struct AsyncGeneratorState {
     pub queue: VecDeque<AsyncGenRequest>,
     /// 正在处理的请求：yield 让出 / await 挂起 / 完成时结算。
     pub current: Option<AsyncGenRequest>,
+    /// 委托协议步：步进取续闭包消费后恢复；恢复入口恒为 None（纯枚举，零 GC 面）。
+    pub delegate_pending: Option<DelegateStep>,
     /// 挂起时的执行上下文（regs/pc/bytecode/各栈段/迭代器/在途异常）。
     pub suspended: crate::suspended::SuspendedFrame,
 }
@@ -74,6 +89,8 @@ const AG_REJECT_PROP: &str = "__oxide_async_gen_reject__";
 const AG_YIELD_PROMISE_PROP: &str = "__oxide_async_gen_yield_promise__";
 /// yield 值 unwrap 恢复闭包上区分委托透传（raw）的属性名。
 const AG_YIELD_RAW_PROP: &str = "__oxide_async_gen_yield_raw__";
+/// 委托步进取续闭包上存协议步的属性名。
+const AG_STEP_PROP: &str = "__oxide_async_gen_delegate_step__";
 
 impl Vm {
     /// 调用异步生成器函数返回的迭代器对象：创建异步生成器实例、挂状态并执行
@@ -96,6 +113,7 @@ impl Vm {
             result: JsValue::undefined(),
             queue: VecDeque::new(),
             current: None,
+            delegate_pending: None,
             suspended: crate::suspended::SuspendedFrame::new_empty(),
         });
         obj_ref.set_native_data(Box::into_raw(state) as *mut u8);
@@ -185,7 +203,7 @@ impl Vm {
     }
 
     /// 取出异步生成器对象的状态指针（调用方须先校验 `is_async_generator_obj`）。
-    fn async_gen_state_ptr(&self, gen_val: JsValue) -> *mut AsyncGeneratorState {
+    pub(crate) fn async_gen_state_ptr(&self, gen_val: JsValue) -> *mut AsyncGeneratorState {
         unsafe { (*gen_val.as_js_object_ptr()).native_data() as *mut AsyncGeneratorState }
     }
 
@@ -324,9 +342,12 @@ impl Vm {
                 return Err("async generator suspended across runs is no longer valid".into());
             }
             state.phase = AsyncGenPhase::Running;
+            // 入口不变量：步进取续闭包先消费协议步再调本函数。
+            debug_assert!(state.delegate_pending.is_none());
         }
 
-        // 委托恢复：把 next/return/throw 请求转发给内层迭代器。
+        // 委托恢复：把 next/return/throw 请求转发给内层异步迭代器，登记步进取续
+        // 闭包等 promise 结算后经快照分支挂起（AwaitSuspended）。
         if self.delegated_iterator.is_some() {
             let mode = {
                 let state = unsafe { &mut *state_ptr };
@@ -336,7 +357,7 @@ impl Vm {
                     .map(|c| c.mode)
                     .unwrap_or(GeneratorResumeMode::Next(JsValue::undefined()))
             };
-            let forwarded = self.delegate_forward(mode);
+            let forwarded = self.delegate_forward_async(mode, gen_val);
             match forwarded {
                 Err(e) => {
                     let exc = self
@@ -346,29 +367,14 @@ impl Vm {
                     self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
                     return self.finish_async_gen_exc(state_ptr, saved, gen_val, exc);
                 }
-                Ok(DelegateOutcome::Suspend { value }) => {
-                    self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
-                    // AsyncGeneratorYield：委托让出值经 promise unwrap 后原样透传。
-                    let value_promise = if self.is_promise_value(value) {
-                        value
-                    } else {
-                        let (p, _, _) = self.new_promise_capability();
-                        let _ = self.resolve_promise(p, value);
-                        p
-                    };
-                    let request = {
-                        let state = unsafe { &mut *state_ptr };
-                        state.current.take()
-                    };
-                    // 委托让出同样在 unwrap 前不可恢复（AsyncGeneratorYield 先 Await）。
+                Ok(DelegateOutcome::Suspend { .. }) => {
+                    // 协议步等待（delegate_pending 已置）：内层 promise 结算前 body 不得
+                    // 继续，快照挂起状态后返回，等步进取续闭包（微任务）恢复。本分支在
+                    // dispatch 之前返回，调度标志须在此恢复（dispatch 后的恢复不会执行）。
                     unsafe { (*state_ptr).phase = AsyncGenPhase::AwaitSuspended };
                     self.snapshot_async_generator(state_ptr)?;
+                    self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
                     self.restore_inline_state(saved);
-                    if let Some(req) = request {
-                        let fulfill_fn = self.make_async_gen_yield_unwrap_fn(gen_val, req.promise, true, false);
-                        let reject_fn = self.make_async_gen_yield_unwrap_fn(gen_val, req.promise, true, true);
-                        let _ = self.perform_promise_then(value_promise, fulfill_fn, reject_fn);
-                    }
                     return Ok(());
                 }
                 Ok(DelegateOutcome::Continue { value }) => {
@@ -428,7 +434,6 @@ impl Vm {
 
         // YIELD 让出：快照挂起状态，让出值经 promise unwrap 后结算当前请求。
         if let Some(value) = self.generator_suspended.take() {
-            let delegating = self.delegated_iterator.is_some();
             // AsyncGeneratorYield：让出值 PromiseResolve 包装后 await 展开
             // （yield 一个 rejected promise 时 next() 的 promise 被 reject）。
             let value_promise = if self.is_promise_value(value) {
@@ -449,8 +454,8 @@ impl Vm {
             self.snapshot_async_generator(state_ptr)?;
             self.restore_inline_state(saved);
             if let Some(req) = request {
-                let fulfill_fn = self.make_async_gen_yield_unwrap_fn(gen_val, req.promise, delegating, false);
-                let reject_fn = self.make_async_gen_yield_unwrap_fn(gen_val, req.promise, delegating, true);
+                let fulfill_fn = self.make_async_gen_yield_unwrap_fn(gen_val, req.promise, false, false);
+                let reject_fn = self.make_async_gen_yield_unwrap_fn(gen_val, req.promise, false, true);
                 let _ = self.perform_promise_then(value_promise, fulfill_fn, reject_fn);
             }
             return Ok(());
@@ -476,6 +481,95 @@ impl Vm {
                 self.finish_async_gen_exc(state_ptr, saved, gen_val, exc)
             }
         }
+    }
+
+    /// `yield*` 委托单步转发（异步生成器）：把外层请求转发给内层异步迭代器，
+    /// 登记步进取续闭包等 promise 结算。
+    ///
+    /// # 步骤
+    /// 1. Next/Throw：取内层 next/throw 方法并以请求值调用；无 throw 方法时回退
+    ///    内层 return()（无参 close），再无 return 方法时抛 TypeError 入 body。
+    /// 2. Return：取内层 return 方法；缺失时以请求值直接完成（Complete）；
+    ///    可调用时调用。
+    /// 3. 调用结果 promise 直通或 PromiseResolve 包装，登记步进取续闭包
+    ///    （Inner/Return/Close），置 `delegate_pending`。
+    ///
+    /// # 返回值
+    /// - `Ok(Suspend)`：协议步等待（`delegate_pending` 已置，调用方经快照分支挂起）；
+    /// - `Ok(Complete)`：内层无 return 方法，外层以请求值直接完成；
+    /// - `Ok(Unwind)`：TypeError 已抛入 body（内层无 throw/return 方法），继续 dispatch；
+    /// - `Err`：内层调用同步抛错，调用方走既有 Err 通道。
+    fn delegate_forward_async(
+        &mut self, mode: GeneratorResumeMode, gen_val: JsValue,
+    ) -> Result<DelegateOutcome, String> {
+        let iterator = match self.delegated_iterator {
+            Some(it) => it,
+            None => return Ok(DelegateOutcome::Unwind),
+        };
+        let (method, arg, mut step) = match mode {
+            GeneratorResumeMode::Next(v) => ("next", v, DelegateStep::Inner),
+            GeneratorResumeMode::Throw(e) => ("throw", e, DelegateStep::Inner),
+            GeneratorResumeMode::Return(v) => ("return", v, DelegateStep::Return),
+        };
+        let iter_obj = unsafe { &*iterator.as_js_object_ptr() };
+        let method_si = self.kernel_core.perm_interner().intern(method).0;
+        let method_fn = self.ordinary_get(iter_obj, method_si, iterator)?;
+        let inner_result = if is_callable(method_fn) {
+            self.call_function_sync(method_fn, iterator, &[arg])?
+        } else {
+            match mode {
+                GeneratorResumeMode::Next(_) => {
+                    return Err(self.error_message_text("TypeError", "iterator.next is not callable"));
+                }
+                GeneratorResumeMode::Return(v) => {
+                    // 内层无 return 方法：外层直接完成，值为请求值。
+                    self.delegated_iterator = None;
+                    return Ok(DelegateOutcome::Complete { value: v });
+                }
+                GeneratorResumeMode::Throw(_) => {
+                    // 内层无 throw 方法：回退内层 return()（无参 close），步为 Close。
+                    let ret_si = self.kernel_core.perm_interner().intern("return").0;
+                    let ret_fn = self.ordinary_get(iter_obj, ret_si, iterator)?;
+                    if !is_callable(ret_fn) {
+                        // 内层亦无 return 方法：close 为 no-op，抛 TypeError 入 body（协议违规）。
+                        self.delegated_iterator = None;
+                        let exc = oxide_builtins::error::create_type_error(
+                            self,
+                            "yield* protocol violation: iterator does not have a throw method",
+                        );
+                        self.exception_value = Some(exc);
+                        self.pending_error_kind = Some(self.thrown_error_kind(exc));
+                        return match self.unwind() {
+                            Ok(()) => Ok(DelegateOutcome::Unwind),
+                            Err(e) => Err(e),
+                        };
+                    }
+                    // 步为 Close：close 成功后抛 TypeError 入 body，拒绝则抛拒绝原因入 body。
+                    step = DelegateStep::Close;
+                    self.call_function_sync(ret_fn, iterator, &[])?
+                }
+            }
+        };
+        // Await：结果 promise 直通，非 promise 经 PromiseResolve 包装。
+        let result_promise = if self.is_promise_value(inner_result) {
+            inner_result
+        } else {
+            match self.promise_resolve(inner_result) {
+                Ok(p) => p,
+                Err(exc) => {
+                    self.last_uncaught_value = Some(exc);
+                    return Err(String::new());
+                }
+            }
+        };
+        // 登记步进取续闭包；先 Call 再置 pending（同步抛错不悬挂）。
+        let fulfill_fn = self.make_delegate_step_closure(gen_val, step, false);
+        let reject_fn = self.make_delegate_step_closure(gen_val, step, true);
+        let _ = self.perform_promise_then(result_promise, fulfill_fn, reject_fn);
+        self.delegated_iterator = Some(iterator);
+        let state = unsafe { &mut *self.async_gen_state_ptr(gen_val) };
+        state.delegate_pending = Some(step);
+        Ok(DelegateOutcome::Suspend { value: JsValue::undefined() })
     }
 
     /// 恢复嵌套 dispatch 覆盖的 VM 标志（dispatch 前提前返回的路径用）。
@@ -599,6 +693,26 @@ impl Vm {
         self.add_fn_name_length(obj, "", 1);
         JsValue::from_js_object(ptr)
     }
+
+    /// 构造委托步进取续闭包：携带目标异步生成器上下文、协议步与 fulfill/reject 角色。
+    pub(crate) fn make_delegate_step_closure(&mut self, ctx: JsValue, step: DelegateStep, reject_role: bool) -> JsValue {
+        let fn_proto = self.session.builtin_world().fn_proto_val();
+        let mut func = JsObject::new_empty(EMPTY_SHAPE_ID, fn_proto);
+        func.set_function(true);
+        // SAFETY: async_gen_delegate_step_closure 是 NativeFn 函数项。
+        func.set_native_fn(Some(unsafe { NativeFnPtr::from_raw(async_gen_delegate_step_closure as *const ()) }));
+        func.set_native_arg_count(1);
+        let ptr = self.alloc_object(func);
+        let obj = unsafe { &mut *ptr };
+        let ctx_si = self.kernel_core.perm_interner().intern(crate::async_func::ASYNC_CTX_PROP).0;
+        self.set_or_create_prop_value(obj, ctx_si, ctx);
+        let step_si = self.kernel_core.perm_interner().intern(AG_STEP_PROP).0;
+        self.set_or_create_prop_value(obj, step_si, JsValue::int(step as i32));
+        let role_si = self.kernel_core.perm_interner().intern(AG_REJECT_PROP).0;
+        self.set_or_create_prop_value(obj, role_si, JsValue::bool(reject_role));
+        self.add_fn_name_length(obj, "", 1);
+        JsValue::from_js_object(ptr)
+    }
 }
 
 /// await 恢复闭包：读自身 prop 的异步生成器上下文与角色，恢复异步生成器继续执行。
@@ -693,6 +807,231 @@ fn async_gen_yield_unwrap_closure(vm: &mut Vm, args: &[u8]) -> NativeResult {
         let _ = vm.async_generator_start(ctx);
     }
     NativeResult::Ok(JsValue::undefined())
+}
+
+/// 委托步进取续闭包：内层 next/return/throw 的 promise 结算时推进委托协议一步。
+///
+/// 读自身 prop 的协议步与角色，校验状态盒 `delegate_pending` 匹配（防陈旧闭包），
+/// 再按步分支（规范：`yield*` 交付值不做二次 Await，失败一律抛入 body 可 catch）：
+/// - Inner：结算值判 done——done 时委托值注入 body 恢复；未 done 时委托值原样
+///   让出（`{value, done:false}` 结算当前请求）；非对象或拒绝原因抛入 body。
+/// - Return：done 时以委托值完成生成器（return completion）；未 done 时委托值
+///   原样让出；拒绝原因 / 非对象抛入 body。
+/// - Close：close 结算后抛 TypeError 入 body（协议违规）；close 拒绝则抛拒绝原因。
+fn async_gen_delegate_step_closure(vm: &mut Vm, args: &[u8]) -> NativeResult {
+    let callee = vm.reg(254);
+    if !callee.is_object() {
+        return NativeResult::Err(oxide_builtins::error::create_type_error(vm, "delegate step handler is invalid"));
+    }
+    let callee_obj = unsafe { &*callee.as_js_object_ptr() };
+    let ctx_si = vm.kernel_core.perm_interner().intern(crate::async_func::ASYNC_CTX_PROP).0;
+    let ctx = vm.resolve_property(callee_obj, ctx_si).unwrap_or(JsValue::undefined());
+    let step_si = vm.kernel_core.perm_interner().intern(AG_STEP_PROP).0;
+    let step = match vm.resolve_property(callee_obj, step_si) {
+        Some(v) if v.is_int() => v.as_int(),
+        _ => return NativeResult::Ok(JsValue::undefined()),
+    };
+    let step = match step {
+        0 => DelegateStep::Inner,
+        1 => DelegateStep::Return,
+        2 => DelegateStep::Close,
+        _ => return NativeResult::Ok(JsValue::undefined()),
+    };
+    let role_si = vm.kernel_core.perm_interner().intern(AG_REJECT_PROP).0;
+    let is_reject = vm
+        .resolve_property(callee_obj, role_si)
+        .is_some_and(oxide_runtime_api::to_boolean);
+    let value = if args.len() > 1 { vm.reg(args[1]) } else { JsValue::undefined() };
+    if !ctx.is_object() {
+        return NativeResult::Ok(JsValue::undefined());
+    }
+    let obj = unsafe { &*ctx.as_js_object_ptr() };
+    if !obj.is_async_generator_obj() {
+        return NativeResult::Ok(JsValue::undefined());
+    }
+    let state_ptr = vm.async_gen_state_ptr(ctx);
+    // 陈旧防御：状态盒的在途协议步必须与本闭包一致。
+    if unsafe { (*state_ptr).delegate_pending } != Some(step) {
+        return NativeResult::Ok(JsValue::undefined());
+    }
+    match step {
+        DelegateStep::Inner => {
+            // 失败子路径：拒绝原因 / 非对象结算值 / done 或 value getter 抛错，
+            // 均抛入 body（body 的 try/catch 可捕获）。
+            let failure = if is_reject {
+                Some(value)
+            } else if !value.is_object() {
+                Some(oxide_builtins::error::create_type_error(vm, "iterator result is not an object"))
+            } else {
+                None
+            };
+            if let Some(exc) = failure {
+                throw_delegate_into_body(vm, ctx, state_ptr, exc);
+                return NativeResult::Ok(JsValue::undefined());
+            }
+            let result_obj = unsafe { &*value.as_js_object_ptr() };
+            let done_si = vm.kernel_core.perm_interner().intern("done").0;
+            let done = match vm.ordinary_get(result_obj, done_si, value) {
+                Ok(d) => oxide_runtime_api::to_boolean(d),
+                Err(e) => {
+                    let exc = vm.last_uncaught_value.take().unwrap_or_else(|| {
+                        oxide_builtins::error::create_from_text(vm, &e)
+                    });
+                    throw_delegate_into_body(vm, ctx, state_ptr, exc);
+                    return NativeResult::Ok(JsValue::undefined());
+                }
+            };
+            let value_si = vm.kernel_core.perm_interner().intern("value").0;
+            let inner_value = match vm.ordinary_get(result_obj, value_si, value) {
+                Ok(v) => v,
+                Err(e) => {
+                    let exc = vm.last_uncaught_value.take().unwrap_or_else(|| {
+                        oxide_builtins::error::create_from_text(vm, &e)
+                    });
+                    throw_delegate_into_body(vm, ctx, state_ptr, exc);
+                    return NativeResult::Ok(JsValue::undefined());
+                }
+            };
+            if done {
+                // 委托 done：委托值注入 body，body 从 yield* 续点继续。清挂起帧的
+                // 委托迭代器（restore_into 会把它写回 VM，不清则恢复后再走 S0 转发）。
+                let state = unsafe { &mut *state_ptr };
+                if let Some(req) = state.current.as_mut() {
+                    req.mode = GeneratorResumeMode::Next(inner_value);
+                }
+                state.delegate_pending = None;
+                state.suspended.delegated_iterator = None;
+                match vm.resume_async_generator(ctx) {
+                    Ok(()) => NativeResult::Ok(JsValue::undefined()),
+                    Err(e) => NativeResult::Err(oxide_builtins::error::create_from_text(vm, &e)),
+                }
+            } else {
+                // 委托未 done：交付值原样让出（规范 yield* 不对值 Await），委托持续。
+                delegate_yield_raw(vm, ctx, state_ptr, inner_value);
+                NativeResult::Ok(JsValue::undefined())
+            }
+        }
+        DelegateStep::Return => {
+            // return 分支：拒绝原因 / 非对象结算值 / getter 抛错均抛入 body；
+            // done:true 以委托值完成生成器；done:false 原样让出委托值。
+            let (done, inner_value) = match read_delegate_result(vm, value) {
+                DelegateResult::Failure(exc) => {
+                    throw_delegate_into_body(vm, ctx, state_ptr, exc);
+                    return NativeResult::Ok(JsValue::undefined());
+                }
+                DelegateResult::Ok(done, inner_value) => (done, inner_value),
+            };
+            if done {
+                // 以委托值完成（return completion，finally 穿越）：改写请求模式为
+                // Return(委托值) 后恢复，注入路径走 complete_generator_return。
+                let state = unsafe { &mut *state_ptr };
+                if let Some(req) = state.current.as_mut() {
+                    req.mode = GeneratorResumeMode::Return(inner_value);
+                }
+                state.delegate_pending = None;
+                state.suspended.delegated_iterator = None;
+                match vm.resume_async_generator(ctx) {
+                    Ok(()) => NativeResult::Ok(JsValue::undefined()),
+                    Err(e) => NativeResult::Err(oxide_builtins::error::create_from_text(vm, &e)),
+                }
+            } else {
+                delegate_yield_raw(vm, ctx, state_ptr, inner_value);
+                NativeResult::Ok(JsValue::undefined())
+            }
+        }
+        DelegateStep::Close => {
+            // close 分支（内层无 throw 方法）：close 结算后抛 TypeError 入 body
+            // （协议违规）；close 拒绝则抛拒绝原因入 body。
+            let exc = if is_reject {
+                value
+            } else {
+                oxide_builtins::error::create_type_error(
+                    vm,
+                    "yield* protocol violation: iterator does not have a throw method",
+                )
+            };
+            throw_delegate_into_body(vm, ctx, state_ptr, exc);
+            NativeResult::Ok(JsValue::undefined())
+        }
+    }
+}
+
+/// 委托结算值读取：done 与 value 的 getter 抛错经 `last_uncaught_value` 取原值。
+enum DelegateResult {
+    /// 结算值读取成功（done 标志与委托值）。
+    Ok(bool, JsValue),
+    /// 结算值读取失败（须抛入 body 的异常值）。
+    Failure(JsValue),
+}
+
+fn read_delegate_result(vm: &mut Vm, value: JsValue) -> DelegateResult {
+    if !value.is_object() {
+        return DelegateResult::Failure(oxide_builtins::error::create_type_error(
+            vm,
+            "iterator result is not an object",
+        ));
+    }
+    let result_obj = unsafe { &*value.as_js_object_ptr() };
+    let done_si = vm.kernel_core.perm_interner().intern("done").0;
+    let done = match vm.ordinary_get(result_obj, done_si, value) {
+        Ok(d) => oxide_runtime_api::to_boolean(d),
+        Err(e) => {
+            let exc = vm
+                .last_uncaught_value
+                .take()
+                .unwrap_or_else(|| oxide_builtins::error::create_from_text(vm, &e));
+            return DelegateResult::Failure(exc);
+        }
+    };
+    let value_si = vm.kernel_core.perm_interner().intern("value").0;
+    let inner_value = match vm.ordinary_get(result_obj, value_si, value) {
+        Ok(v) => v,
+        Err(e) => {
+            let exc = vm
+                .last_uncaught_value
+                .take()
+                .unwrap_or_else(|| oxide_builtins::error::create_from_text(vm, &e));
+            return DelegateResult::Failure(exc);
+        }
+    };
+    DelegateResult::Ok(done, inner_value)
+}
+
+/// 委托让出：内层值原样交付（规范 `yield*` 不对交付值 Await），以 `{value, done:false}`
+/// 结算当前请求、恢复可让出状态、驱动队列。
+///
+/// 微任务上下文专用：不恢复生成器执行（生成器已让出，等待下一个 next/return/throw）。
+fn delegate_yield_raw(vm: &mut Vm, ctx: JsValue, state_ptr: *mut AsyncGeneratorState, value: JsValue) {
+    {
+        let state = unsafe { &mut *state_ptr };
+        state.delegate_pending = None;
+        if unsafe { (*state_ptr).phase } == AsyncGenPhase::AwaitSuspended {
+            unsafe { (*state_ptr).phase = AsyncGenPhase::YieldSuspended };
+        }
+    }
+    let request = unsafe { (*state_ptr).current.take() };
+    if let Some(req) = request {
+        let result = make_iter_result(vm, value, false);
+        let _ = vm.resolve_promise(req.promise, result);
+    }
+    if !unsafe { (*state_ptr).queue.is_empty() } {
+        let _ = vm.async_generator_start(ctx);
+    }
+}
+
+/// 把委托协议异常抛入 body：当前请求改写为 Throw(exc)、清协议状态后恢复
+/// （body 的 catch 可捕获；无 catch 时既有 finish 通道 reject 请求并完成）。
+fn throw_delegate_into_body(vm: &mut Vm, ctx: JsValue, state_ptr: *mut AsyncGeneratorState, exc: JsValue) {
+    {
+        let state = unsafe { &mut *state_ptr };
+        if let Some(req) = state.current.as_mut() {
+            req.mode = GeneratorResumeMode::Throw(exc);
+        }
+        state.delegate_pending = None;
+        // 清挂起帧的委托迭代器（restore_into 会把它写回 VM，不清则恢复后再走 S0 转发）。
+        state.suspended.delegated_iterator = None;
+    }
+    let _ = vm.resume_async_generator(ctx);
 }
 
 /// `%AsyncGeneratorPrototype%.next`：入队 next 请求并返回其结果 Promise。
@@ -1188,6 +1527,7 @@ pub(crate) fn clone_async_generator_native_with_rewrite(
             resolve: rewrite(req.resolve),
             reject: rewrite(req.reject),
         }),
+        delegate_pending: state.delegate_pending,
         suspended: state.suspended.clone_with_rewrite(rewrite),
     };
     new.set_native_data(Box::into_raw(Box::new(cloned)) as *mut u8);

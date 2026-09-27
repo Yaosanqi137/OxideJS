@@ -77,6 +77,9 @@ pub(crate) enum YieldStarOutcome {
     Continue(JsValue),
     /// 异常已展开到外层 catch/finally：继续 dispatch。
     Unwind,
+    /// 异步生成器委托：内层迭代已登记微任务队列，外层挂起让出
+    /// （数据经 async_gen_suspended 信号与状态盒 delegate_pending 传递）。
+    AsyncSuspend,
 }
 
 /// `yield*` 委托转发（生成器恢复时）的结局。
@@ -429,6 +432,11 @@ impl Vm {
     /// - 内层 next 同步执行，可能压入/弹出调用帧。
     /// - 挂起时设置 `delegated_iterator`，由 snapshot_generator 存入生成器状态。
     pub(crate) fn dispatch_yield_star(&mut self, rd: usize) -> Result<YieldStarOutcome, String> {
+        // 异步生成器委托走异步迭代协议（GetAsyncIterator + promise 结算），
+        // 同步路径原样保留。
+        if self.async_gen_dispatch {
+            return self.dispatch_yield_star_async(rd);
+        }
         let inner = self.regs[rd];
         let iterator = match oxide_builtins::iterator::make_iterator_for_value_without_return(self, inner) {
             Ok(it) => it,
@@ -473,6 +481,71 @@ impl Vm {
             // 挂起让出内层原始结果对象：外层 next() 原样透传（done 字段保持内层值）。
             Ok(YieldStarOutcome::Suspend(result))
         }
+    }
+
+    /// `yield*` 异步委托首次推进：GetAsyncIterator 取内层异步迭代器并推进一次。
+    ///
+    /// # 步骤
+    /// 1. 经 GetAsyncIterator 取内层迭代器（`@@asyncIterator` 优先，缺失回退同步
+    ///    迭代器包 AsyncFromSyncIterator）。
+    /// 2. 调内层 next(undefined) 得结果 R0。
+    /// 3. Await 结算：R0 为 promise 时直通，否则 PromiseResolve 包装。
+    /// 4. 登记步进取续闭包（Inner 步）到结果 promise，置
+    ///    `delegated_iterator` 与 `delegate_pending` 并挂起。
+    ///
+    /// # 边界
+    /// - 任一步同步抛错经 `yield_star_raise` 展开（可被 body catch）；
+    ///   顺序约束为先 Call 再置 pending 与挂起标志，同步抛错不悬挂。
+    ///
+    /// # 副作用
+    /// - 内层 next 同步执行，可能压入/弹出调用帧。
+    /// - 登记步进取续闭包（微任务队列 GC 根持有）。
+    /// - 置 `delegated_iterator`、`delegate_pending` 与 `async_gen_suspended`。
+    pub(crate) fn dispatch_yield_star_async(&mut self, rd: usize) -> Result<YieldStarOutcome, String> {
+        let inner = self.regs[rd];
+        let iterator = match crate::async_from_sync::make_async_iterator(self, inner) {
+            Ok(it) => it,
+            Err(exc) => {
+                self.last_uncaught_value = Some(exc);
+                return self.yield_star_raise(String::new());
+            }
+        };
+        let iter_obj = unsafe { &*iterator.as_js_object_ptr() };
+        let next_si = self.kernel_core.perm_interner().intern("next").0;
+        let next_fn = match self.ordinary_get(iter_obj, next_si, iterator) {
+            Ok(f) => f,
+            Err(e) => return self.yield_star_raise(e),
+        };
+        let result = if is_callable(next_fn) {
+            match self.call_function_sync(next_fn, iterator, &[JsValue::undefined()]) {
+                Ok(r) => r,
+                Err(e) => return self.yield_star_raise(e),
+            }
+        } else {
+            return self.yield_star_raise(self.error_message_text("TypeError", "iterator.next is not callable"));
+        };
+        // Await：结果 promise 直通，非 promise 经 PromiseResolve 包装。
+        let result_promise = if self.is_promise_value(result) {
+            result
+        } else {
+            match self.promise_resolve(result) {
+                Ok(p) => p,
+                Err(exc) => {
+                    self.last_uncaught_value = Some(exc);
+                    return self.yield_star_raise(String::new());
+                }
+            }
+        };
+        // 登记步进取续闭包（Inner 步）；先 Call 再置 pending 与挂起标志。
+        let gen_val = self.async_gen_context.expect("async yield* outside async generator");
+        let fulfill_fn = self.make_delegate_step_closure(gen_val, crate::async_generator::DelegateStep::Inner, false);
+        let reject_fn = self.make_delegate_step_closure(gen_val, crate::async_generator::DelegateStep::Inner, true);
+        let _ = self.perform_promise_then(result_promise, fulfill_fn, reject_fn);
+        self.delegated_iterator = Some(iterator);
+        let state = unsafe { &mut *self.async_gen_state_ptr(gen_val) };
+        state.delegate_pending = Some(crate::async_generator::DelegateStep::Inner);
+        self.async_gen_suspended = true;
+        Ok(YieldStarOutcome::AsyncSuspend)
     }
 
     /// `yield*` 委托单步转发：把外层恢复请求转发给内层迭代器。
