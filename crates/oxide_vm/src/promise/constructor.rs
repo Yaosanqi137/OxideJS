@@ -56,6 +56,9 @@ impl Vm {
     /// 构造帧 new.target 槽 = newTarget。Reflect.construct 面的入口；newTarget 与
     /// 构造器本身同值时与 `construct_ctor` 逐位等价。
     ///
+    /// bound 包装按 BoundFunctionExoticConstruct 逐层解包：绑定实参前置（内层先）、
+    /// newTarget 逐层指针相等替换为包装体，最内层非构造器判定后递归进入对应臂。
+    ///
     /// # 边界与前提
     /// - `ctor` 非可构造值返回 TypeError 的 `Err`；`new_target` 的可构造性由调用方
     ///   入口校验。失败时消费 `last_uncaught_value`，`Err` 携带原始抛出值，
@@ -73,6 +76,37 @@ impl Vm {
         // SAFETY: 调用方入口已对 new_target 做过同谓词 IsConstructor 校验，
         // 指针非空且指向存活对象。
         let nt_obj = unsafe { &*new_target.as_js_object_ptr() };
+        // bound 包装：解包链（绑定实参前置、newTarget 逐层指针相等替换），
+        // 最内层非构造器判定后递归进入既有臂。
+        if ctor_obj.type_tag == JsObject::OBJ_TYPE_BOUND {
+            let mut cur = ctor;
+            let mut cur_obj = ctor_obj;
+            let mut nt = new_target;
+            let mut combined = args.to_vec();
+            while cur_obj.type_tag == JsObject::OBJ_TYPE_BOUND {
+                // 纯读无 GC 点：状态对象布局 [target, thisArg, ...boundArgs]。
+                let state = oxide_builtins::function::bound_state_values(cur_obj);
+                let target = state.first().copied().unwrap_or(JsValue::undefined());
+                if !target.is_object() {
+                    // 非对象的最内层 target 不可构造。
+                    return Err(oxide_builtins::error::create_type_error(self, "object is not a constructor"));
+                }
+                for v in state.iter().skip(2) {
+                    combined.insert(0, *v);
+                }
+                if cur == nt {
+                    nt = target;
+                }
+                cur = target;
+                // SAFETY: is_object 守卫保证指针非空且指向存活对象；只读 type_tag
+                // 判定分支，不跨 GC/reset。
+                cur_obj = unsafe { &*cur.as_js_object_ptr() };
+            }
+            if !is_constructor_value(cur) {
+                return Err(oxide_builtins::error::create_type_error(self, "object is not a constructor"));
+            }
+            return self.construct_with(cur, nt, &combined);
+        }
         // native 构造器：receiver 为新对象（this 取 newTarget.prototype），值传递调用。
         if ctor_obj.native_fn().is_some() {
             // DataView 构造器不预分配 this：其体内先做全部校验、后读 newTarget.prototype

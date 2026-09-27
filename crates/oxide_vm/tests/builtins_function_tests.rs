@@ -320,3 +320,25 @@ fn bound_function_construct_errors() {
     .unwrap();
     assert_num(result, 9.0);
 }
+
+#[test]
+fn bound_function_newtarget_pins() {
+    let mut vm = Vm::new();
+    // Reflect.construct 以 bound 包装为构造器：new.target 逐层替换到最内层
+    // target（SameValue(F, newTarget) → target），三种 newTarget 形态同值。
+    for src in [
+        "var nt; function A() { nt = new.target; } var B = A.bind(); var C = B.bind(); Reflect.construct(C, [], C); nt === A",
+        "var nt; function A() { nt = new.target; } var B = A.bind(); var C = B.bind(); Reflect.construct(C, [], A); nt === A",
+        "var nt; function A() { nt = new.target; } var B = A.bind(); var C = B.bind(); Reflect.construct(C, [], B); nt === A",
+    ] {
+        let result = eval(&mut vm, src).unwrap();
+        assert!(result.as_bool(), "for {}", src);
+    }
+    // 构造实例原型链指向最内层 target 的 prototype。
+    let result = eval(
+        &mut vm,
+        "function A() {} var B = A.bind(); var C = B.bind(); Object.getPrototypeOf(Reflect.construct(C, [], C)) === A.prototype",
+    )
+    .unwrap();
+    assert!(result.as_bool());
+}
