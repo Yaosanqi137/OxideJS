@@ -281,6 +281,104 @@ fn for_await_of_close_throw_object_identity_preserved() {
     );
 }
 
+// ── 逃出关闭测试矩阵（E1-E10）：多层 LIFO 关闭与 Completion 边角 ──
+//
+// for-await-of 的 next() 经 await 结算，循环体在 N 层嵌套时深 N 个微任务 tick；
+// 读取 log 的 then 回调须比最深的结算闭包更晚入队，故用足够长的 then 链延迟读取。
+
+/// 延迟 N 个微任务 tick 后读取 log（N 层逃出需 N+2 个 tick 让全部结算闭包跑完）。
+fn delay_read(n: usize) -> String {
+    let mut chain = "Promise.resolve()".to_string();
+    for _ in 0..n {
+        chain.push_str(".then(()=>{})");
+    }
+    chain.push_str(".then(()=>log.join(','))");
+    chain
+}
+
+#[test]
+fn for_await_of_break_escape_middle_layer() {
+    // E2b：break 逃出中间 for-await-of 层——内层迭代器关闭，外层继续迭代。
+    let source = "let log=[];\
+                  const mk=(n)=>({[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:n,done:false})},return(){log.push('c'+n);return Promise.resolve({done:true})}}}});\
+                  (async()=>{ for await (const a of mk(1)) { for await (const b of mk(2)) { log.push('body'); break; } log.push('after'); break; } })();\
+                  ".to_string()
+        + &delay_read(4);
+    assert_eq!(eval(&source), "\"body,c2,after,c1\"");
+}
+
+#[test]
+fn for_await_of_labeled_continue_closes_inner() {
+    // E3：labeled continue 逃出内层 for-await-of——内层迭代器每轮关闭，外层继续。
+    // 外层迭代器有限（两轮后 done），验证 continue 不关闭外层、外层继续迭代。
+    let source = "let log=[];\
+                  let outerN=0;\
+                  const outer={[Symbol.asyncIterator](){return{next(){outerN++;if(outerN>2)return Promise.resolve({value:undefined,done:true});return Promise.resolve({value:outerN,done:false});},return(){log.push('cO');return Promise.resolve({done:true})}}}};\
+                  const inner={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},return(){log.push('cI');return Promise.resolve({done:true})}}}};\
+                  (async()=>{ outer: for await (const a of outer) { for await (const b of inner) { log.push('body'); continue outer; } log.push('after-inner'); } })();\
+                  ".to_string()
+        + &delay_read(6);
+    assert_eq!(eval(&source), "\"body,cI,body,cI\"");
+}
+
+#[test]
+fn for_await_of_multi_layer_return_escape_lifo() {
+    // E4：多层 return 逃出（两层 for-await-of）——LIFO 顺序关闭（内层先）。
+    // 内层 return() 先被调（c2），外层后（c1），关闭顺序验证 LIFO。
+    let source = "let log=[];\
+                  const mk=(n)=>({[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:n,done:false})},return(){log.push('c'+n);return Promise.resolve({done:true})}}}});\
+                  (async()=>{ for await (const a of mk(1)) { for await (const b of mk(2)) { log.push('body'); return 42; } } })();\
+                  ".to_string()
+        + &delay_read(4);
+    assert_eq!(eval(&source), "\"body,c2,c1\"");
+}
+
+#[test]
+fn for_await_of_multi_layer_labeled_break_escape_lifo() {
+    // E5：多层 labeled break 逃出——LIFO 顺序关闭（内层先），跳转目标正确。
+    let source = "let log=[];\
+                  const mk=(n)=>({[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:n,done:false})},return(){log.push('c'+n);return Promise.resolve({done:true})}}}});\
+                  (async()=>{ outer: for await (const a of mk(1)) { for await (const b of mk(2)) { log.push('body'); break outer; } } log.push('after'); })();\
+                  ".to_string()
+        + &delay_read(4);
+    assert_eq!(eval(&source), "\"body,c2,c1,after\"");
+}
+
+#[test]
+fn for_await_of_escape_close_reject_outer_catch() {
+    // E6：逃出时 return() 拒绝——拒绝原因替代完成值，外围 catch 捕获。
+    let source = "let log=[];\
+                  const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},return(){return Promise.reject('rej');}}}};\
+                  (async()=>{ try { for await (const x of it) { log.push('body'); return 1; } } catch (e) { log.push('caught:'+e); } log.push('done'); })();\
+                  ".to_string()
+        + &delay_read(3);
+    assert_eq!(eval(&source), "\"body,caught:rej,done\"");
+}
+
+#[test]
+fn for_await_of_escape_no_return_method() {
+    // E8：迭代器无 return 方法——不登记挂起，完成直接继续。
+    let source = "let log=[];\
+                  const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})}}}};\
+                  (async()=>{ for await (const x of it) { log.push('body'); return 1; } })();\
+                  "
+    .to_string()
+        + &delay_read(2);
+    assert_eq!(eval(&source), "\"body\"");
+}
+
+#[test]
+fn for_await_of_escape_settlement_precedes_then() {
+    // E10：微任务时序——结算闭包（执行完成）先于后续 then 回调。
+    // break 逃出后，完成跳转（log.push('after')）在结算闭包内执行，须先于 then 回调。
+    let source = "let log=[];\
+                  const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},return(){return Promise.resolve({done:true})}}}};\
+                  (async()=>{ for await (const x of it) { log.push('body'); break; } log.push('after'); })();\
+                  ".to_string()
+        + &delay_read(3);
+    assert_eq!(eval(&source), "\"body,after\"");
+}
+
 // ── class/object 生成器方法（异步） ──
 
 // class async 生成器方法：yield 顺序与 done 收敛。顶层 then 链驱动

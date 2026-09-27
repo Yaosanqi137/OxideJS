@@ -65,7 +65,7 @@ pub(crate) const ASYNC_CTX_PROP: &str = "__oxide_async_ctx__";
 /// 恢复闭包上区分 reject 角色的属性名。
 const ASYNC_REJECT_PROP: &str = "__oxide_async_reject__";
 /// 逃出关闭结算闭包上存 return() promise 的属性名（陈旧防御校验用）。
-const ASYNC_ESCAPE_PROMISE_PROP: &str = "__oxide_async_escape_promise__";
+pub(crate) const ASYNC_ESCAPE_PROMISE_PROP: &str = "__oxide_async_escape_promise__";
 
 impl Vm {
     /// 调用异步函数返回的 capability promise：创建上下文对象 + 状态盒，立即压帧
@@ -389,14 +389,16 @@ impl Vm {
         Ok(())
     }
 
-    /// 恢复逃出 for-await-of 的异步函数：return() 的 promise 结算后执行完成。
+    /// 恢复逃出 for-await-of 的异步函数：return() 的 promise 结算后继续关闭剩余
+    /// 条目并执行完成。
     ///
     /// # 步骤
     /// 1. 陈旧防御：状态盒 pending_async_escape.close_promise 须与本闭包 promise
     ///    匹配，不匹配则不处理（防同一 promise 被双结算）。
-    /// 2. 把挂起快照灌回 VM，取出完成并清除 pending_async_escape。
-    /// 3. 执行完成：Return 走 do_return，Break/Continue 跳转 target_pc 续 dispatch。
-    /// 4. 再挂起则快照新状态；完成/异常则结算 capability。恢复调用方状态。
+    /// 2. 把挂起快照灌回 VM，取出完成与剩余待关条目并清除 pending_async_escape。
+    /// 3. 多层逃出：remaining 非空时逐层关闭（每层一轮结算），空了才执行完成。
+    /// 4. 执行完成：Return 走 do_return，Break/Continue 跳转 target_pc 续 dispatch。
+    /// 5. 再挂起则快照新状态；完成/异常则结算 capability。恢复调用方状态。
     ///
     /// # 边界与前提
     /// - 关闭 promise 拒绝时（reject 角色），拒绝值替代在途完成：抛拒绝原因，
@@ -406,6 +408,8 @@ impl Vm {
     ) -> Result<(), String> {
         let state_ptr = self.async_state_ptr(ctx);
         let saved = self.save_inline_state(256);
+        // 清上一轮多层关闭残留的挂起信号（多层逐层结算每轮清零，防陈旧信号误消费）。
+        self.async_suspended = false;
         let prev_ctx = self.async_context.take();
         let prev_dispatch = self.async_dispatch;
         let prev_gen_ctx = self.async_gen_context.take();
@@ -438,8 +442,29 @@ impl Vm {
             state.phase = AsyncPhase::Running;
         }
 
-        // 取出完成并清除 pending_async_escape。
-        let completion = self.pending_async_escape.take().unwrap().completion;
+        // 取出完成与剩余待关条目并清除 pending_async_escape。
+        let (completion, mut remaining) = match self.pending_async_escape.take() {
+            Some(p) => (p.completion, p.remaining),
+            // 陈旧防御已早退，正常路径此处必为 Some；防御性兜底。
+            None => return Ok(()),
+        };
+
+        // 多层逃出：remaining 非空时逐层关闭（每层一轮结算），空了才执行完成
+        // （或抛拒绝原因）。挂起信号由 register 置位，快照后返回续下一轮结算。
+        while let Some(next_iter) = remaining.first().cloned() {
+            remaining.remove(0);
+            match self.register_async_escape_close(next_iter, completion, remaining.clone()) {
+                Ok(true) => {
+                    self.snapshot_async(unsafe { &mut *state_ptr })?;
+                    self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+                    self.native_call_depth -= 1;
+                    self.restore_inline_state(saved);
+                    return Ok(());
+                }
+                Ok(false) => continue,
+                Err(e) => return Err(e),
+            }
+        }
 
         // 关闭拒绝：拒绝值替代在途完成。抛拒绝原因，外围 catch/finally 接管；
         // 无处理器时异步函数以拒绝原因拒绝。
@@ -479,7 +504,7 @@ impl Vm {
             return Ok(());
         }
 
-        // 单层路径：remaining 恒空，直接执行完成。
+        // remaining 已空，执行完成。
         match completion {
             Completion::Return { value: ret_val, .. } => {
                 let result = self.do_return(ret_val)?;

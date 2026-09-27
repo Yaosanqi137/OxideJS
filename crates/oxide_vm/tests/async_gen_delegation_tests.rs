@@ -360,3 +360,29 @@ fn t18_throw_close_non_object_result_typeerror() {
         "\"caught:IteratorResult is not an object:true\""
     );
 }
+
+// T19：异步生成器体内 for-await-of 多层 return 逃出——LIFO 顺序关闭（内层先），
+// 完成值经 next() 的 promise 交付（{value:42, done:true}）。
+#[test]
+fn t19_async_gen_multi_layer_return_escape_lifo() {
+    let source = "let log=[];\
+                  const mk=(n)=>({[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:n,done:false})},return(){log.push('c'+n);return Promise.resolve({done:true})}}}});\
+                  async function* g() { for await (const a of mk(1)) { for await (const b of mk(2)) { log.push('body'); return 42; } } }\
+                  (async function run() { const it = g(); const r = await it.next(); \
+                  return log.join(',') + '|' + r.done + ':' + r.value; })()"
+        .to_string();
+    assert_eq!(eval(&source), "\"body,c2,c1|true:42\"");
+}
+
+// T20：异步生成器体内 for-await-of break 逃出——关闭迭代器后 body 继续，
+// 后续 yield 正常交付（验证 break 跳转 target_pc 正确、生成器未误完成）。
+#[test]
+fn t20_async_gen_break_escape_continues() {
+    let source = "let log=[];\
+                  const it={[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:1,done:false})},return(){log.push('close');return Promise.resolve({done:true})}}}};\
+                  async function* g() { for await (const x of it) { log.push('body'); break; } yield 'after'; }\
+                  (async function run() { const it = g(); const r = await it.next(); \
+                  return log.join(',') + '|' + r.value + ':' + r.done; })()"
+        .to_string();
+    assert_eq!(eval(&source), "\"body,close|after:false\"");
+}

@@ -945,9 +945,9 @@ impl Vm {
 
     /// 逃出关闭：按 LIFO 弹出逃出的 for-in 迭代器（无 return() 语义），再关闭逃出的
     /// for-of 迭代器。同步迭代器同步关闭；异步迭代器（for-await-of）同步调 return()
-    /// 得 promise，登记结算闭包后挂起。逃出路径非 suppress：return() 抛错经
-    /// raise_call_error 展开，剩余迭代器由 unwind 的 close_for_of_above 以 suppress
-    /// 继续关闭——新错误替代原完成值向外传播。
+    /// 得 promise，登记结算闭包后挂起，剩余异步条目入 remaining 逐层续关。逃出路径
+    /// 非 suppress：return() 抛错经 raise_call_error 展开，剩余迭代器由 unwind 的
+    /// close_for_of_above 以 suppress 继续关闭——新错误替代原完成值向外传播。
     ///
     /// # 返回值
     /// `Done` = 全部关闭完成，调用方继续跳转/返回动作；`Handled` = return() 抛错且
@@ -960,16 +960,14 @@ impl Vm {
         for _ in 0..for_in_count {
             self.iters.pop_for_in();
         }
-        // 单层路径：首个异步条目登记关闭，其余异步条目丢弃（多层路径填 remaining）。
-        let mut first_async: Option<JsValue> = None;
+        // 多层路径：异步条目按 LIFO 收集（前元素先关），同步条目当场关闭。
+        let mut async_iters: Vec<JsValue> = Vec::new();
         for _ in 0..for_of_count {
             let Some(entry) = self.iters.pop_for_of() else {
                 break;
             };
             if entry.is_async {
-                if first_async.is_none() {
-                    first_async = Some(entry.iterator);
-                }
+                async_iters.push(entry.iterator);
                 continue;
             }
             let pc_before = self.pc;
@@ -984,13 +982,14 @@ impl Vm {
                 return Ok(CloseEscapeOutcome::Handled);
             }
         }
-        if let Some(iterator) = first_async {
-            match self.register_async_escape_close(iterator, completion, Vec::new()) {
-                Ok(true) => {
-                    self.async_suspended = true;
-                    return Ok(CloseEscapeOutcome::Suspended);
-                }
-                Ok(false) => {}
+        // 异步条目逐层关闭：首个有 return 方法的登记挂起，其余入 remaining；无
+        // return 方法时继续下一层。
+        let mut remaining = async_iters;
+        while let Some(iterator) = remaining.first().cloned() {
+            remaining.remove(0);
+            match self.register_async_escape_close(iterator, completion, remaining.clone()) {
+                Ok(true) => return Ok(CloseEscapeOutcome::Suspended),
+                Ok(false) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -998,19 +997,20 @@ impl Vm {
     }
 
     /// 登记逃出 for-await-of 的异步关闭：同步调 return() 得 promise，登记结算闭包，
-    /// 置 pending_async_escape。迭代器无 return 方法时不登记（完成直接继续）。
+    /// 置 pending_async_escape 与挂起信号。迭代器无 return 方法时不登记（完成直接
+    /// 继续）。
+    ///
+    /// # 边界与前提
+    /// - 异步生成器派发（`async_gen_dispatch`）走异步生成器状态盒与结算闭包，置
+    ///   `async_gen_suspended`；普通异步函数走异步上下文，置 `async_suspended`。
+    /// - 同步生成器无异步上下文：不登记挂起（完成直接继续）。
     ///
     /// # 返回值
     /// `Ok(true)` = 已登记挂起；`Ok(false)` = 无 return 方法，无需挂起；`Err` = 关闭
     /// 过程出错。
-    fn register_async_escape_close(
+    pub(crate) fn register_async_escape_close(
         &mut self, iterator: JsValue, completion: Completion, remaining: Vec<JsValue>,
     ) -> Result<bool, String> {
-        // 异步生成器走独立状态盒（AsyncGeneratorState），本路径的结算闭包按
-        // AsyncState 恢复——不登记挂起（异步迭代器保持既有跳过行为，完成直接继续）。
-        if self.async_gen_dispatch {
-            return Ok(false);
-        }
         if !iterator.is_object() {
             return Ok(false);
         }
@@ -1037,8 +1037,25 @@ impl Vm {
                 }
             }
         };
-        // 同步生成器无异步上下文：不登记挂起（异步迭代器保持既有跳过行为，完成直接继续）。
-        let Some(ctx) = self.async_context.or(self.async_gen_context) else {
+        // 异步生成器派发：异步生成器状态盒与结算闭包，置 async_gen_suspended。
+        if self.async_gen_dispatch {
+            let Some(ctx) = self.async_gen_context else {
+                return Ok(false);
+            };
+            let fulfill_fn = self.make_async_gen_escape_close_fn(ctx, promise, false);
+            let reject_fn = self.make_async_gen_escape_close_fn(ctx, promise, true);
+            let _ = self.perform_promise_then(promise, fulfill_fn, reject_fn);
+            self.pending_async_escape = Some(PendingAsyncEscape {
+                close_promise: promise,
+                completion,
+                remaining,
+            });
+            self.async_gen_suspended = true;
+            return Ok(true);
+        }
+        // 普通异步函数：异步上下文与结算闭包，置 async_suspended。同步生成器无
+        // 异步上下文：不登记挂起（完成直接继续）。
+        let Some(ctx) = self.async_context else {
             return Ok(false);
         };
         let fulfill_fn = self.make_async_escape_close_fn(ctx, promise, false);
@@ -1049,6 +1066,7 @@ impl Vm {
             completion,
             remaining,
         });
+        self.async_suspended = true;
         Ok(true)
     }
 

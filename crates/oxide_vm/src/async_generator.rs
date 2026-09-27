@@ -21,7 +21,7 @@ use oxide_types::object::{Cell, JsObject, NativeFnPtr, PropAttributes};
 use oxide_types::value::JsValue;
 
 use crate::generator::{DelegateOutcome, GeneratorResumeMode};
-use crate::vm::Vm;
+use crate::vm::{Completion, Vm};
 
 /// 异步生成器执行阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,13 +429,20 @@ impl Vm {
         }
 
         let result = self.dispatch();
-        self.async_gen_dispatch = prev_agd;
-        self.async_gen_context = prev_gen_ctx;
-        self.generator_dispatch = prev_gd;
-        self.async_dispatch = prev_ad;
-        self.async_context = prev_ctx;
-        self.native_call_depth -= 1;
+        self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+        self.post_dispatch_async_gen(state_ptr, saved, gen_val, result)
+    }
 
+    /// 异步生成器恢复的 dispatch 后处理：YIELD 让出（快照 + 让出值 unwrap 结算）、
+    /// AWAIT 挂起（快照）、完成/异常（结算当前请求）。
+    ///
+    /// # 前提
+    /// 调度标志已恢复（调用方先恢复再调本函数）；本函数内部按结果快照新状态并
+    /// 恢复调用方内联状态。
+    fn post_dispatch_async_gen(
+        &mut self, state_ptr: *mut AsyncGeneratorState, saved: Box<crate::vm::InlineSyncState>, gen_val: JsValue,
+        result: Result<JsValue, String>,
+    ) -> Result<(), String> {
         // YIELD 让出：快照挂起状态，让出值经 promise unwrap 后结算当前请求。
         if let Some(value) = self.generator_suspended.take() {
             // AsyncGeneratorYield：让出值 PromiseResolve 包装后 await 展开
@@ -758,6 +765,154 @@ impl Vm {
         self.add_fn_name_length(obj, "", 1);
         JsValue::from_js_object(ptr)
     }
+
+    /// 构造逃出关闭结算闭包（异步生成器）：携带目标异步生成器上下文对象与
+    /// return() promise，区分 fulfill/reject 角色。
+    pub(crate) fn make_async_gen_escape_close_fn(
+        &mut self, ctx: JsValue, promise: JsValue, reject_role: bool,
+    ) -> JsValue {
+        let fn_proto = self.session.builtin_world().fn_proto_val();
+        let mut func = JsObject::new_empty(EMPTY_SHAPE_ID, fn_proto);
+        func.set_function(true);
+        // SAFETY: async_gen_escape_closure 是 NativeFn 函数项。
+        func.set_native_fn(Some(unsafe { NativeFnPtr::from_raw(async_gen_escape_closure as *const ()) }));
+        func.set_native_arg_count(1);
+        let ptr = self.alloc_object(func);
+        let obj = unsafe { &mut *ptr };
+        let ctx_si = self.kernel_core.perm_interner().intern(crate::async_func::ASYNC_CTX_PROP).0;
+        self.set_or_create_prop_value(obj, ctx_si, ctx);
+        let role_si = self.kernel_core.perm_interner().intern(AG_REJECT_PROP).0;
+        self.set_or_create_prop_value(obj, role_si, JsValue::bool(reject_role));
+        let promise_si = self
+            .kernel_core
+            .perm_interner()
+            .intern(crate::async_func::ASYNC_ESCAPE_PROMISE_PROP)
+            .0;
+        self.set_or_create_prop_value(obj, promise_si, promise);
+        self.add_fn_name_length(obj, "", 1);
+        JsValue::from_js_object(ptr)
+    }
+
+    /// 恢复逃出 for-await-of 的异步生成器：return() 的 promise 结算后继续关闭剩余
+    /// 条目并执行完成。
+    ///
+    /// # 步骤
+    /// 1. 陈旧防御：状态盒 pending_async_escape.close_promise 须与本闭包 promise
+    ///    匹配，不匹配则不处理（防同一 promise 被双结算）。
+    /// 2. 把挂起快照灌回 VM，取出完成与剩余待关条目并清除 pending_async_escape。
+    /// 3. 多层逃出：remaining 非空时逐层关闭（每层一轮结算），空了才执行完成。
+    /// 4. 执行完成：Return 走 do_return 完成生成器，Break/Continue 跳转 target_pc
+    ///    续 dispatch。
+    /// 5. 再挂起则快照新状态；完成/异常则结算当前请求。恢复调用方状态。
+    ///
+    /// # 边界与前提
+    /// - 关闭 promise 拒绝时（reject 角色），拒绝值替代在途完成：抛拒绝原因，
+    ///   外围 catch/finally 接管；无处理器时当前请求以拒绝原因拒绝。
+    pub(crate) fn resume_async_gen_escape(
+        &mut self, ctx: JsValue, promise: JsValue, is_reject: bool, value: JsValue,
+    ) -> Result<(), String> {
+        let state_ptr = self.async_gen_state_ptr(ctx);
+        let saved = self.save_inline_state(256);
+        // 清上一轮多层关闭残留的挂起信号（多层逐层结算每轮清零，防陈旧信号误消费）。
+        self.generator_suspended = None;
+        self.async_gen_suspended = false;
+        let prev_ctx = self.async_context.take();
+        let prev_gd = self.generator_dispatch;
+        let prev_ad = self.async_dispatch;
+        let prev_gen_ctx = self.async_gen_context.take();
+        let prev_agd = self.async_gen_dispatch;
+        self.generator_dispatch = true;
+        self.async_dispatch = true;
+        self.async_gen_dispatch = true;
+        self.async_context = Some(ctx);
+        self.async_gen_context = Some(ctx);
+        self.native_call_depth += 1;
+
+        {
+            let state = unsafe { &mut *state_ptr };
+            // 陈旧防御：close_promise 须匹配，陈旧闭包不处理。
+            let is_stale = !matches!(
+                state.suspended.pending_async_escape.as_ref(),
+                Some(p) if p.close_promise == promise
+            );
+            if is_stale {
+                self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                self.restore_inline_state(saved);
+                return Ok(());
+            }
+            let restore_res = state.suspended.restore_into(self, state.callee);
+            if restore_res.is_err() {
+                self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                self.restore_inline_state(saved);
+                return Err("async generator suspended across runs is no longer valid".into());
+            }
+            state.phase = AsyncGenPhase::Running;
+        }
+
+        // 取出完成与剩余待关条目并清除 pending_async_escape。
+        let (completion, mut remaining) = match self.pending_async_escape.take() {
+            Some(p) => (p.completion, p.remaining),
+            // 陈旧防御已早退，正常路径此处必为 Some；防御性兜底。
+            None => {
+                self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                self.restore_inline_state(saved);
+                return Ok(());
+            }
+        };
+
+        // 多层逃出：remaining 非空时逐层关闭（每层一轮结算），空了才执行完成
+        // （或抛拒绝原因）。挂起信号由 register 置位，快照后返回续下一轮结算。
+        while let Some(next_iter) = remaining.first().cloned() {
+            remaining.remove(0);
+            match self.register_async_escape_close(next_iter, completion, remaining.clone()) {
+                Ok(true) => {
+                    unsafe { (*state_ptr).phase = AsyncGenPhase::AwaitSuspended };
+                    self.snapshot_async_generator(state_ptr)?;
+                    self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                    self.restore_inline_state(saved);
+                    return Ok(());
+                }
+                Ok(false) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        // 关闭拒绝：拒绝值替代在途完成。抛拒绝原因，外围 catch/finally 接管；
+        // 无处理器时当前请求以拒绝原因拒绝。
+        if is_reject {
+            self.exception_value = Some(value);
+            self.pending_error_kind = Some(self.thrown_error_kind(value));
+            if self.unwind().is_err() {
+                let exc = self.last_uncaught_value.take().unwrap_or(value);
+                self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                return self.finish_async_gen_exc(state_ptr, saved, ctx, exc);
+            }
+            let result = self.dispatch();
+            self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+            return self.post_dispatch_async_gen(state_ptr, saved, ctx, result);
+        }
+
+        // remaining 已空，执行完成。
+        match completion {
+            Completion::Return { value: ret_val, .. } => {
+                let result = self.do_return(ret_val)?;
+                if let Some(result) = result {
+                    self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                    return self.finish_async_gen_ok(state_ptr, saved, ctx, result);
+                }
+                // 嵌套帧未弹空：续 dispatch。
+                let result = self.dispatch();
+                self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                self.post_dispatch_async_gen(state_ptr, saved, ctx, result)
+            }
+            Completion::Break { target_pc, .. } | Completion::Continue { target_pc, .. } => {
+                self.pc = target_pc;
+                let result = self.dispatch();
+                self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
+                self.post_dispatch_async_gen(state_ptr, saved, ctx, result)
+            }
+        }
+    }
 }
 
 /// await 恢复闭包：读自身 prop 的异步生成器上下文与角色，恢复异步生成器继续执行。
@@ -1053,6 +1208,33 @@ fn async_gen_delegate_return_await_closure(vm: &mut Vm, args: &[u8]) -> NativeRe
     // 清挂起帧的委托迭代器（restore_into 会把它写回 VM，不清则恢复后再走 S0 转发）。
     state.suspended.delegated_iterator = None;
     match vm.resume_async_generator(ctx) {
+        Ok(()) => NativeResult::Ok(JsValue::undefined()),
+        Err(e) => NativeResult::Err(oxide_builtins::error::create_from_text(vm, &e)),
+    }
+}
+
+/// 逃出关闭结算闭包（异步生成器）：读自身 prop 的异步生成器上下文、return()
+/// promise 与角色，恢复挂起帧并继续关闭剩余条目、执行完成。
+fn async_gen_escape_closure(vm: &mut Vm, args: &[u8]) -> NativeResult {
+    let callee = vm.reg(254);
+    if !callee.is_object() {
+        return NativeResult::Err(oxide_builtins::error::create_type_error(vm, "escape close handler is invalid"));
+    }
+    let callee_obj = unsafe { &*callee.as_js_object_ptr() };
+    let ctx_si = vm.kernel_core.perm_interner().intern(crate::async_func::ASYNC_CTX_PROP).0;
+    let ctx = vm.resolve_property(callee_obj, ctx_si).unwrap_or(JsValue::undefined());
+    let role_si = vm.kernel_core.perm_interner().intern(AG_REJECT_PROP).0;
+    let is_reject = vm
+        .resolve_property(callee_obj, role_si)
+        .is_some_and(oxide_runtime_api::to_boolean);
+    let promise_si = vm
+        .kernel_core
+        .perm_interner()
+        .intern(crate::async_func::ASYNC_ESCAPE_PROMISE_PROP)
+        .0;
+    let promise = vm.resolve_property(callee_obj, promise_si).unwrap_or(JsValue::undefined());
+    let value = if args.len() > 1 { vm.reg(args[1]) } else { JsValue::undefined() };
+    match vm.resume_async_gen_escape(ctx, promise, is_reject, value) {
         Ok(()) => NativeResult::Ok(JsValue::undefined()),
         Err(e) => NativeResult::Err(oxide_builtins::error::create_from_text(vm, &e)),
     }
