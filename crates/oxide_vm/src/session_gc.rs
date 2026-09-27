@@ -222,7 +222,13 @@ impl SessionGc {
                 stack.push(ptr);
             } else if !ptr.is_null() {
                 // SAFETY: 执行核心产出的对象值，指针在 session 生命周期内有效。
-                if unsafe { (&*ptr).is_epoch() } {
+                let obj = unsafe { &*ptr };
+                if obj.is_epoch() {
+                    stack.push(ptr);
+                } else {
+                    // perm 对象（builtin world / global 等）不回收，但可持有 session
+                    // 子引用（defineProperty 写入 builtin 原型等）：入栈由 DFS 扫边
+                    // 标活，否则该子引用永不被标活 → 原地 sweep 误释放 → 悬垂。
                     stack.push(ptr);
                 }
             }
@@ -434,6 +440,10 @@ impl SessionGc {
             live_bigints.insert(ptr);
         }
 
+        // perm 对象不入 sweep 表、mark 位不被 clear_all_marks 清除，无法用 mark 位
+        // 防重访；builtin 图有环（如 Object.prototype.constructor → Object），
+        // 须独立已访集合，否则 DFS 无限重访。每轮 mark 重置。
+        let mut visited_perm = HashSet::with_hasher(FxBuildHasher);
         for ptr in seeds {
             if ptr.is_null() {
                 continue;
@@ -451,8 +461,11 @@ impl SessionGc {
                     stack.push(ptr);
                     continue;
                 }
-                // P 对象根（builtin world / global）不回收，只扫边。
-                Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints, live_cells);
+                // P 对象根（builtin world / global）不回收，只扫边；登记已访防
+                // 后续作为 perm 边被重扫。
+                if visited_perm.insert(ptr) {
+                    Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints, live_cells);
+                }
             }
         }
 
@@ -460,9 +473,17 @@ impl SessionGc {
             if ptr.is_null() {
                 continue;
             }
-            // SAFETY: ptr 由根/session 边发现，session 根检查保证它是合法 session 对象指针。
+            // SAFETY: ptr 由根/session 边发现，session 根检查保证它是合法对象指针。
             unsafe {
                 let obj = &mut *ptr;
+                // perm 对象不回收：只扫边标活 session 子引用，不置 mark 位（其位
+                // 跨收集残留会令下次 DFS 短路漏扫）。已访则跳过，防 perm 环重入。
+                if !vm.is_session_ptr(ptr) && !obj.is_epoch() {
+                    if visited_perm.insert(ptr) {
+                        Self::scan_edges_for_mark(obj, vm, stack, live_strings, live_bigints, live_cells);
+                    }
+                    continue;
+                }
                 if obj.is_gc_marked() {
                     continue;
                 }
