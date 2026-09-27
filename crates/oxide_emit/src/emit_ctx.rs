@@ -20,12 +20,12 @@ pub(crate) enum LoopKind {
 }
 
 impl LoopKind {
-    /// 是否计入 for-of 逃出关闭计数。for-await-of 的逃出（labeled break /
-    /// continue / return）需要异步 await 迭代器 return() 的 promise，走
-    /// 异步挂起机制另行实现——此处只计同步 for-of，避免运行时同步调用异步
-    /// 迭代器的 return()。
+    /// 是否计入 for-of 逃出关闭计数。同步 for-of 与 for-await-of 都计入：
+    /// for-await-of 的逃出（labeled break / continue / return）经运行时异步关闭
+    /// 机制 await 迭代器 return() 的 promise，逃出计数须含其条目，运行时据此
+    /// 弹出并登记异步关闭。
     pub(crate) fn is_for_of(self) -> bool {
-        matches!(self, LoopKind::ForOf)
+        matches!(self, LoopKind::ForOf | LoopKind::ForAwaitOf)
     }
 
     pub(crate) fn is_for_in(self) -> bool {

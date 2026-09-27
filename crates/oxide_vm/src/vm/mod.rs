@@ -145,6 +145,18 @@ pub(crate) fn format_error_message(name: &str, msg: &str) -> String {
     }
 }
 
+/// 逃出 for-await-of 的异步关闭在途状态：return() 的 promise 挂起等待结算，
+/// 结算闭包（微任务）恢复挂起帧后继续关闭剩余条目并执行完成。
+#[derive(Debug)]
+pub(crate) struct PendingAsyncEscape {
+    /// 正在等待的 return() promise（结算闭包陈旧防御校验用）。
+    pub(crate) close_promise: JsValue,
+    /// 悬挂的完成（Break/Continue/Return），结算后执行。
+    pub(crate) completion: Completion,
+    /// 剩余待关闭的异步迭代器（LIFO 序，前元素先关）。单层路径恒空，多层路径填充。
+    pub(crate) remaining: Vec<JsValue>,
+}
+
 /// 基于寄存器的 JS 虚拟机：持有执行状态、寄存器文件、调用栈与 session 内存。
 ///
 /// 执行入口为 [`Vm::run`]（见 `vm_runtime` 模块）；内存模型为 epoch arena +
@@ -235,6 +247,9 @@ pub struct Vm {
     pub(crate) pending_error_kind: Option<&'static str>,
     /// 控制流完成（break/continue/return）暂存，finally 执行后由 TRY_FINALLY_END 恢复。
     pub(crate) pending_completion: Option<Completion>,
+    /// 逃出 for-await-of 的异步关闭在途状态：return() 的 promise 挂起等待结算，
+    /// 结算闭包（微任务）恢复挂起帧后继续关闭剩余条目并执行完成。
+    pub(crate) pending_async_escape: Option<PendingAsyncEscape>,
     pub(crate) root_reg_limit: u8,
     pub(crate) active_reg_limit: u8,
     pub(crate) native_call_depth: usize,

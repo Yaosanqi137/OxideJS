@@ -11,7 +11,7 @@ use oxide_bytecode::opcode;
 use oxide_types::object::Cell;
 use oxide_types::value::JsValue;
 
-use crate::vm::{CallFrame, Completion, ForInIter, TryHandler, Vm};
+use crate::vm::{CallFrame, Completion, ForInIter, PendingAsyncEscape, TryHandler, Vm};
 use crate::vm_state::ForOfEntry;
 
 /// 挂起执行上下文快照（三份状态结构体共享的执行核心）。
@@ -40,6 +40,8 @@ pub(crate) struct SuspendedFrame {
     pub pending_exception: Option<JsValue>,
     pub pending_error_kind: Option<&'static str>,
     pub pending_completion: Option<Completion>,
+    /// 逃出 for-await-of 的异步关闭在途状态（随挂起快照跨微任务存活）。
+    pub pending_async_escape: Option<PendingAsyncEscape>,
 }
 
 impl SuspendedFrame {
@@ -66,6 +68,7 @@ impl SuspendedFrame {
             pending_exception: None,
             pending_error_kind: None,
             pending_completion: None,
+            pending_async_escape: None,
         }
     }
 
@@ -106,6 +109,7 @@ impl SuspendedFrame {
         self.pending_exception = vm.pending_exception.take();
         self.pending_error_kind = vm.pending_error_kind.take();
         self.pending_completion = vm.pending_completion.take();
+        self.pending_async_escape = std::mem::take(&mut vm.pending_async_escape);
         Ok(())
     }
 
@@ -162,6 +166,7 @@ impl SuspendedFrame {
         vm.pending_exception = self.pending_exception.take();
         vm.pending_error_kind = self.pending_error_kind.take();
         vm.pending_completion = self.pending_completion.take();
+        vm.pending_async_escape = std::mem::take(&mut self.pending_async_escape);
         Ok(())
     }
 
@@ -210,6 +215,15 @@ impl SuspendedFrame {
         }
         if let Some(Completion::Return { value, .. }) = self.pending_completion {
             f(value);
+        }
+        if let Some(pend) = &self.pending_async_escape {
+            f(pend.close_promise);
+            if let Completion::Return { value, .. } = pend.completion {
+                f(value);
+            }
+            for &v in &pend.remaining {
+                f(v);
+            }
         }
         for iter in &self.for_in_iters {
             if iter.is_null() {
@@ -270,6 +284,27 @@ impl SuspendedFrame {
                 for_in_count,
             },
             other => other,
+        });
+        self.pending_async_escape = self.pending_async_escape.as_mut().map(|pend| {
+            let completion = match pend.completion {
+                Completion::Return {
+                    value,
+                    remaining_finally,
+                    for_of_count,
+                    for_in_count,
+                } => Completion::Return {
+                    value: rewrite(value),
+                    remaining_finally,
+                    for_of_count,
+                    for_in_count,
+                },
+                other => other,
+            };
+            PendingAsyncEscape {
+                close_promise: rewrite(pend.close_promise),
+                completion,
+                remaining: pend.remaining.iter().copied().map(&mut rewrite).collect(),
+            }
         });
         for iter in &mut self.for_in_iters {
             if iter.is_null() {
@@ -352,6 +387,24 @@ impl SuspendedFrame {
                     for_in_count,
                 },
                 other => other,
+            }),
+            pending_async_escape: self.pending_async_escape.as_ref().map(|p| PendingAsyncEscape {
+                close_promise: rewrite(p.close_promise),
+                completion: match p.completion {
+                    Completion::Return {
+                        value,
+                        remaining_finally,
+                        for_of_count,
+                        for_in_count,
+                    } => Completion::Return {
+                        value: rewrite(value),
+                        remaining_finally,
+                        for_of_count,
+                        for_in_count,
+                    },
+                    other => other,
+                },
+                remaining: p.remaining.iter().copied().map(&mut rewrite).collect(),
             }),
         }
     }
@@ -436,6 +489,16 @@ mod tests {
             remaining_finally: 0,
             for_of_count: 0,
             for_in_count: 0,
+        });
+        frame.pending_async_escape = Some(PendingAsyncEscape {
+            close_promise: JsValue::float(12.0),
+            completion: Completion::Return {
+                value: JsValue::float(13.0),
+                remaining_finally: 0,
+                for_of_count: 0,
+                for_in_count: 0,
+            },
+            remaining: vec![JsValue::float(14.0)],
         });
     }
 

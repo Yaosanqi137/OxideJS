@@ -13,7 +13,7 @@ use oxide_runtime_api::{to_boolean, NativeResult};
 use oxide_types::object::{Cell, JsObject, NativeFnPtr, PropAttributes};
 use oxide_types::value::JsValue;
 
-use crate::vm::Vm;
+use crate::vm::{Completion, Vm};
 
 /// 异步函数执行阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,8 @@ pub(crate) enum AsyncResumeMode {
 pub(crate) const ASYNC_CTX_PROP: &str = "__oxide_async_ctx__";
 /// 恢复闭包上区分 reject 角色的属性名。
 const ASYNC_REJECT_PROP: &str = "__oxide_async_reject__";
+/// 逃出关闭结算闭包上存 return() promise 的属性名（陈旧防御校验用）。
+const ASYNC_ESCAPE_PROMISE_PROP: &str = "__oxide_async_escape_promise__";
 
 impl Vm {
     /// 调用异步函数返回的 capability promise：创建上下文对象 + 状态盒，立即压帧
@@ -356,6 +358,27 @@ impl Vm {
         JsValue::from_js_object(ptr)
     }
 
+    /// 构造逃出关闭结算闭包：携带目标异步上下文对象与 return() promise，区分
+    /// fulfill/reject 角色。
+    pub(crate) fn make_async_escape_close_fn(&mut self, ctx: JsValue, promise: JsValue, reject_role: bool) -> JsValue {
+        let fn_proto = self.session.builtin_world().fn_proto_val();
+        let mut func = JsObject::new_empty(EMPTY_SHAPE_ID, fn_proto);
+        func.set_function(true);
+        // SAFETY: async_escape_close_closure 是 NativeFn 函数项。
+        func.set_native_fn(Some(unsafe { NativeFnPtr::from_raw(async_escape_close_closure as *const ()) }));
+        func.set_native_arg_count(1);
+        let ptr = self.alloc_object(func);
+        let obj = unsafe { &mut *ptr };
+        let ctx_si = self.kernel_core.perm_interner().intern(ASYNC_CTX_PROP).0;
+        self.set_or_create_prop_value(obj, ctx_si, ctx);
+        let role_si = self.kernel_core.perm_interner().intern(ASYNC_REJECT_PROP).0;
+        self.set_or_create_prop_value(obj, role_si, JsValue::bool(reject_role));
+        let promise_si = self.kernel_core.perm_interner().intern(ASYNC_ESCAPE_PROMISE_PROP).0;
+        self.set_or_create_prop_value(obj, promise_si, promise);
+        self.add_fn_name_length(obj, "", 1);
+        JsValue::from_js_object(ptr)
+    }
+
     /// 把当前 VM 执行状态（异步 body 刚在嵌套 dispatch 中让出）快照进状态盒。
     ///
     /// 异步帧弹出存 `suspended.frame`，其余栈段整段搬入（嵌套循环期间这些栈
@@ -363,6 +386,133 @@ impl Vm {
     fn snapshot_async(&mut self, state: &mut AsyncState) -> Result<(), String> {
         state.suspended.save_from(self, state.callee)?;
         state.phase = AsyncPhase::Suspended;
+        Ok(())
+    }
+
+    /// 恢复逃出 for-await-of 的异步函数：return() 的 promise 结算后执行完成。
+    ///
+    /// # 步骤
+    /// 1. 陈旧防御：状态盒 pending_async_escape.close_promise 须与本闭包 promise
+    ///    匹配，不匹配则不处理（防同一 promise 被双结算）。
+    /// 2. 把挂起快照灌回 VM，取出完成并清除 pending_async_escape。
+    /// 3. 执行完成：Return 走 do_return，Break/Continue 跳转 target_pc 续 dispatch。
+    /// 4. 再挂起则快照新状态；完成/异常则结算 capability。恢复调用方状态。
+    ///
+    /// # 边界与前提
+    /// - 关闭 promise 拒绝时（reject 角色），拒绝值替代在途完成：抛拒绝原因，
+    ///   外围 catch/finally 接管；无处理器时异步函数以拒绝原因拒绝。
+    fn resume_async_escape(
+        &mut self, ctx: JsValue, promise: JsValue, is_reject: bool, value: JsValue,
+    ) -> Result<(), String> {
+        let state_ptr = self.async_state_ptr(ctx);
+        let saved = self.save_inline_state(256);
+        let prev_ctx = self.async_context.take();
+        let prev_dispatch = self.async_dispatch;
+        let prev_gen_ctx = self.async_gen_context.take();
+        let prev_gen_dispatch = self.async_gen_dispatch;
+        self.async_dispatch = true;
+        self.async_gen_dispatch = false;
+        self.async_context = Some(ctx);
+        self.native_call_depth += 1;
+
+        {
+            let state = unsafe { &mut *state_ptr };
+            // 陈旧防御：close_promise 须匹配，陈旧闭包不处理。
+            let is_stale = !matches!(
+                state.suspended.pending_async_escape.as_ref(),
+                Some(p) if p.close_promise == promise
+            );
+            if is_stale {
+                self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+                self.native_call_depth -= 1;
+                self.restore_inline_state(saved);
+                return Ok(());
+            }
+            let restore_res = state.suspended.restore_into(self, state.callee);
+            if restore_res.is_err() {
+                self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+                self.native_call_depth -= 1;
+                self.restore_inline_state(saved);
+                return Err("async function suspended across runs is no longer valid".into());
+            }
+            state.phase = AsyncPhase::Running;
+        }
+
+        // 取出完成并清除 pending_async_escape。
+        let completion = self.pending_async_escape.take().unwrap().completion;
+
+        // 关闭拒绝：拒绝值替代在途完成。抛拒绝原因，外围 catch/finally 接管；
+        // 无处理器时异步函数以拒绝原因拒绝。
+        if is_reject {
+            self.exception_value = Some(value);
+            self.pending_error_kind = Some(self.thrown_error_kind(value));
+            if self.unwind().is_err() {
+                let exc = self.last_uncaught_value.take().unwrap_or(value);
+                self.finish_async(state_ptr, Err(exc))?;
+                self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+                self.native_call_depth -= 1;
+                self.restore_inline_state(saved);
+                return Ok(());
+            }
+            let result = self.dispatch();
+            // 处理器体内再挂起（await）：快照新状态后退出。
+            if std::mem::take(&mut self.async_suspended) {
+                self.snapshot_async(unsafe { &mut *state_ptr })?;
+                self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+                self.native_call_depth -= 1;
+                self.restore_inline_state(saved);
+                return Ok(());
+            }
+            match result {
+                Ok(value) => self.finish_async(state_ptr, Ok(value))?,
+                Err(e) => {
+                    let exc = self
+                        .last_uncaught_value
+                        .take()
+                        .unwrap_or_else(|| oxide_builtins::error::create_from_text(self, &e));
+                    self.finish_async(state_ptr, Err(exc))?;
+                }
+            }
+            self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+            self.native_call_depth -= 1;
+            self.restore_inline_state(saved);
+            return Ok(());
+        }
+
+        // 单层路径：remaining 恒空，直接执行完成。
+        match completion {
+            Completion::Return { value: ret_val, .. } => {
+                let result = self.do_return(ret_val)?;
+                if let Some(result) = result {
+                    self.finish_async(state_ptr, Ok(result))?;
+                }
+            }
+            Completion::Break { target_pc, .. } | Completion::Continue { target_pc, .. } => {
+                self.pc = target_pc;
+                let result = self.dispatch();
+                // 完成跳转后 body 继续执行到下一个 await/return/异常。
+                if std::mem::take(&mut self.async_suspended) {
+                    self.snapshot_async(unsafe { &mut *state_ptr })?;
+                    self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+                    self.native_call_depth -= 1;
+                    self.restore_inline_state(saved);
+                    return Ok(());
+                }
+                match result {
+                    Ok(value) => self.finish_async(state_ptr, Ok(value))?,
+                    Err(e) => {
+                        let exc = self
+                            .last_uncaught_value
+                            .take()
+                            .unwrap_or_else(|| oxide_builtins::error::create_from_text(self, &e));
+                        self.finish_async(state_ptr, Err(exc))?;
+                    }
+                }
+            }
+        }
+        self.restore_async_flags(prev_ctx, prev_dispatch, prev_gen_ctx, prev_gen_dispatch);
+        self.native_call_depth -= 1;
+        self.restore_inline_state(saved);
         Ok(())
     }
 }
@@ -385,6 +535,27 @@ fn async_await_resume_closure(vm: &mut Vm, args: &[u8]) -> NativeResult {
         AsyncResumeMode::Next(value)
     };
     match vm.resume_async(ctx, mode) {
+        Ok(()) => NativeResult::Ok(JsValue::undefined()),
+        Err(e) => NativeResult::Err(oxide_builtins::error::create_from_text(vm, &e)),
+    }
+}
+
+/// 逃出关闭结算闭包：读自身 prop 的异步上下文、return() promise 与角色，恢复挂起
+/// 帧并执行完成。
+fn async_escape_close_closure(vm: &mut Vm, args: &[u8]) -> NativeResult {
+    let callee = vm.reg(254);
+    if !callee.is_object() {
+        return NativeResult::Err(oxide_builtins::error::create_type_error(vm, "escape close handler is invalid"));
+    }
+    let callee_obj = unsafe { &*callee.as_js_object_ptr() };
+    let ctx_si = vm.kernel_core.perm_interner().intern(ASYNC_CTX_PROP).0;
+    let ctx = vm.resolve_property(callee_obj, ctx_si).unwrap_or(JsValue::undefined());
+    let role_si = vm.kernel_core.perm_interner().intern(ASYNC_REJECT_PROP).0;
+    let is_reject = vm.resolve_property(callee_obj, role_si).is_some_and(to_boolean);
+    let promise_si = vm.kernel_core.perm_interner().intern(ASYNC_ESCAPE_PROMISE_PROP).0;
+    let promise = vm.resolve_property(callee_obj, promise_si).unwrap_or(JsValue::undefined());
+    let value = if args.len() > 1 { vm.reg(args[1]) } else { JsValue::undefined() };
+    match vm.resume_async_escape(ctx, promise, is_reject, value) {
         Ok(()) => NativeResult::Ok(JsValue::undefined()),
         Err(e) => NativeResult::Err(oxide_builtins::error::create_from_text(vm, &e)),
     }

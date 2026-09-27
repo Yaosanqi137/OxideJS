@@ -728,19 +728,21 @@ impl Vm {
         // （栈上迭代器属于本生成器），完成恢复处统一关闭。
         let for_of_count = self.iters.for_of_iters.len();
         let for_in_count = self.iters.for_in_iters.len();
-        if let Some(finally_pc) = self.record_completion(crate::vm::Completion::Return {
+        let completion = crate::vm::Completion::Return {
             value,
             remaining_finally: crossed,
             for_of_count,
             for_in_count,
-        }) {
+        };
+        if let Some(finally_pc) = self.record_completion(completion) {
             self.pc = finally_pc;
             return Ok(None);
         }
         // 无 finally：关闭逃出迭代器后直接交付返回（弹出生成器帧后 frames 为空 → Some(value)）。
-        match self.close_escaped_iters(for_of_count, for_in_count) {
-            Ok(true) => self.do_return(value),
-            Ok(false) => Ok(None),
+        match self.close_escaped_iters(completion) {
+            Ok(crate::vm_dispatch_ctrl::CloseEscapeOutcome::Done) => self.do_return(value),
+            Ok(crate::vm_dispatch_ctrl::CloseEscapeOutcome::Handled) => Ok(None),
+            Ok(crate::vm_dispatch_ctrl::CloseEscapeOutcome::Suspended) => Ok(None),
             Err(e) => Err(e),
         }
     }

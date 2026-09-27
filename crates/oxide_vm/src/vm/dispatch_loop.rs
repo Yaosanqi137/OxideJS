@@ -385,10 +385,21 @@ impl Vm {
 
                 OpCode::BREAK => {
                     self.dispatch_break(instr)?;
+                    // 逃出 for-await-of 的异步关闭可能经 await 挂起（return() 的
+                    // promise），挂起时须像 AWAIT 一样让内嵌 dispatch 返回，由恢复方
+                    // 快照状态。
+                    if self.async_suspended || self.async_gen_suspended {
+                        self.profiling.set_instruction_count(steps);
+                        return Ok(JsValue::undefined());
+                    }
                 }
 
                 OpCode::CONTINUE => {
                     self.dispatch_continue(instr)?;
+                    if self.async_suspended || self.async_gen_suspended {
+                        self.profiling.set_instruction_count(steps);
+                        return Ok(JsValue::undefined());
+                    }
                 }
 
                 OpCode::JMP_IF_FALSE => {
@@ -550,7 +561,15 @@ impl Vm {
 
                 OpCode::RETURN => match self.dispatch_return(instr) {
                     Ok(Some(result)) => return Ok(result),
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // 逃出 for-await-of 的异步关闭可能经 await 挂起（return() 的
+                        // promise），挂起时须像 AWAIT 一样让内嵌 dispatch 返回，由恢复
+                        // 方快照状态。
+                        if self.async_suspended || self.async_gen_suspended {
+                            self.profiling.set_instruction_count(steps);
+                            return Ok(JsValue::undefined());
+                        }
+                    }
                     Err(e) => return Err(e),
                 },
 
@@ -815,7 +834,15 @@ impl Vm {
 
                 OpCode::TRY_FINALLY_END => match self.dispatch_try_finally_end() {
                     Ok(Some(result)) => return Ok(result),
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // 逃出 for-await-of 的异步关闭可能经 await 挂起（return() 的
+                        // promise），挂起时须像 AWAIT 一样让内嵌 dispatch 返回，由恢复
+                        // 方快照状态。
+                        if self.async_suspended || self.async_gen_suspended {
+                            self.profiling.set_instruction_count(steps);
+                            return Ok(JsValue::undefined());
+                        }
+                    }
                     Err(e) => return Err(e),
                 },
 

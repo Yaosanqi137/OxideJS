@@ -226,8 +226,8 @@ fn for_await_of_body_throw_closes_and_original_error_wins() {
 #[test]
 fn for_await_of_return_escape_defers_async_close() {
     // return 逃出 for-await-of：异步迭代器 return() 的 promise 须 await 后结算，
-    // 走异步关闭机制（后续阶段）；阶段 1 同步逃出路径不得同步调用异步 return()。
-    // 断言循环体已执行且没有同步副作用泄露。
+    // 走异步关闭机制。return() 同步调用（log.push('close') 同步执行），promise 经
+    // 微任务结算后完成返回。断言循环体与关闭副作用都已执行。
     assert_eq!(
         eval(
             "let log=[];\
@@ -235,7 +235,7 @@ fn for_await_of_return_escape_defers_async_close() {
              (async()=>{ for await (const x of it) { log.push('body'); return 1; } })();\
              Promise.resolve().then(()=>log.join(','))"
         ),
-        "\"body\""
+        "\"body,close\""
     );
 }
 

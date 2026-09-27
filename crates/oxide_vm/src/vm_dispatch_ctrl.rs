@@ -1,9 +1,19 @@
-use crate::vm::{Completion, FrameArgs, FrameContinuation, TryHandler, Vm};
+use crate::vm::{Completion, FrameArgs, FrameContinuation, PendingAsyncEscape, TryHandler, Vm};
 use crate::vm_trace;
 use oxide_bytecode::opcode;
 use oxide_types::object::{JsObject, PropAttributes};
 use oxide_types::private_key::make_private_name_id;
 use oxide_types::value::JsValue;
+
+/// 逃出关闭结果：`Done` = 全部关闭完成，调用方继续跳转/返回动作；
+/// `Handled` = return() 抛错且异常已被外围 catch/finally 接管（unwind 已改写
+/// pc），调用方须丢弃原完成动作；`Suspended` = 异步关闭已登记挂起，调用方
+/// 须早退（由结算闭包续）。
+pub(crate) enum CloseEscapeOutcome {
+    Done,
+    Handled,
+    Suspended,
+}
 
 impl Vm {
     pub(crate) fn dispatch_call(&mut self, rd: usize, a: usize, b: usize) -> Result<bool, String> {
@@ -578,19 +588,21 @@ impl Vm {
         let offset = opcode::offset16(instr) as isize;
         let target_pc = ((self.pc as isize) + offset - 1) as usize;
         let crossed = opcode::rd(instr) as usize;
-        if let Some(finally_pc) = self.record_completion(Completion::Break {
+        let completion = Completion::Break {
             target_pc,
             remaining_finally: crossed,
             for_of_count,
             for_in_count,
-        }) {
+        };
+        if let Some(finally_pc) = self.record_completion(completion) {
             self.pc = finally_pc;
         } else {
             // 无 finally 穿越：关闭逃出迭代器后跳转；return() 抛错被接管时
             // unwind 已设 pc，跳过跳转。
-            match self.close_escaped_iters(for_of_count, for_in_count) {
-                Ok(true) => self.pc = target_pc,
-                Ok(false) => {}
+            match self.close_escaped_iters(completion) {
+                Ok(CloseEscapeOutcome::Done) => self.pc = target_pc,
+                Ok(CloseEscapeOutcome::Handled) => {}
+                Ok(CloseEscapeOutcome::Suspended) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -603,19 +615,21 @@ impl Vm {
         let offset = opcode::offset16(instr) as isize;
         let target_pc = ((self.pc as isize) + offset - 1) as usize;
         let crossed = opcode::rd(instr) as usize;
-        if let Some(finally_pc) = self.record_completion(Completion::Continue {
+        let completion = Completion::Continue {
             target_pc,
             remaining_finally: crossed,
             for_of_count,
             for_in_count,
-        }) {
+        };
+        if let Some(finally_pc) = self.record_completion(completion) {
             self.pc = finally_pc;
         } else {
             // 无 finally 穿越：关闭逃出迭代器后跳转；return() 抛错被接管时
             // unwind 已设 pc，跳过跳转。
-            match self.close_escaped_iters(for_of_count, for_in_count) {
-                Ok(true) => self.pc = target_pc,
-                Ok(false) => {}
+            match self.close_escaped_iters(completion) {
+                Ok(CloseEscapeOutcome::Done) => self.pc = target_pc,
+                Ok(CloseEscapeOutcome::Handled) => {}
+                Ok(CloseEscapeOutcome::Suspended) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -706,20 +720,22 @@ impl Vm {
             .iter()
             .filter(|h| h.frame_depth == self.frames.len() && h.finally_pc.is_some())
             .count();
-        if let Some(finally_pc) = self.record_completion(Completion::Return {
+        let completion = Completion::Return {
             value: result,
             remaining_finally: crossed,
             for_of_count,
             for_in_count,
-        }) {
+        };
+        if let Some(finally_pc) = self.record_completion(completion) {
             self.pc = finally_pc;
             return Ok(None);
         }
         // 无 finally 穿越：关闭逃出迭代器后返回；return() 抛错被接管时原完成值
         // 被新错误替代，跳过实际返回。
-        match self.close_escaped_iters(for_of_count, for_in_count) {
-            Ok(true) => self.do_return(result),
-            Ok(false) => Ok(None),
+        match self.close_escaped_iters(completion) {
+            Ok(CloseEscapeOutcome::Done) => self.do_return(result),
+            Ok(CloseEscapeOutcome::Handled) => Ok(None),
+            Ok(CloseEscapeOutcome::Suspended) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -906,62 +922,54 @@ impl Vm {
             }
         }
         match c {
-            Completion::Break {
-                target_pc,
-                for_of_count,
-                for_in_count,
-                ..
-            }
-            | Completion::Continue {
-                target_pc,
-                for_of_count,
-                for_in_count,
-                ..
-            } => {
+            Completion::Break { target_pc, .. } | Completion::Continue { target_pc, .. } => {
                 // 全部 finally 穿越完成、真正跳转前关闭逃出迭代器——与规范顺序
                 // （循环体完成值已含内部 try-finally 处理，IteratorClose 在后）一致。
                 // return() 抛错被接管时 unwind 已设 pc，跳过跳转。
-                match self.close_escaped_iters(for_of_count, for_in_count) {
-                    Ok(true) => self.pc = target_pc,
-                    Ok(false) => {}
+                match self.close_escaped_iters(c) {
+                    Ok(CloseEscapeOutcome::Done) => self.pc = target_pc,
+                    Ok(CloseEscapeOutcome::Handled) => {}
+                    Ok(CloseEscapeOutcome::Suspended) => {}
                     Err(e) => return Err(e),
                 }
                 Ok(None)
             }
-            Completion::Return {
-                value,
-                for_of_count,
-                for_in_count,
-                ..
-            } => match self.close_escaped_iters(for_of_count, for_in_count) {
-                Ok(true) => self.do_return(value),
-                Ok(false) => Ok(None),
+            Completion::Return { value, .. } => match self.close_escaped_iters(c) {
+                Ok(CloseEscapeOutcome::Done) => self.do_return(value),
+                Ok(CloseEscapeOutcome::Handled) => Ok(None),
+                Ok(CloseEscapeOutcome::Suspended) => Ok(None),
                 Err(e) => Err(e),
             },
         }
     }
 
     /// 逃出关闭：按 LIFO 弹出逃出的 for-in 迭代器（无 return() 语义），再关闭逃出的
-    /// for-of 迭代器。异步迭代器条目（for-await-of）跳过——其 return() 返回 promise
-    /// 须 await 后结算，走独立异步关闭机制。逃出路径非 suppress：return() 抛错经
+    /// for-of 迭代器。同步迭代器同步关闭；异步迭代器（for-await-of）同步调 return()
+    /// 得 promise，登记结算闭包后挂起。逃出路径非 suppress：return() 抛错经
     /// raise_call_error 展开，剩余迭代器由 unwind 的 close_for_of_above 以 suppress
     /// 继续关闭——新错误替代原完成值向外传播。
     ///
     /// # 返回值
-    /// `Ok(true)` = 全部关闭完成，调用方继续跳转/返回动作；`Ok(false)` = return()
-    /// 抛错且异常已被外围 catch/finally 接管（unwind 已改写 pc），调用方须丢弃
-    /// 原完成动作；`Err` = 无处理器，异常逃逸。
-    pub(crate) fn close_escaped_iters(&mut self, for_of_count: usize, for_in_count: usize) -> Result<bool, String> {
+    /// `Done` = 全部关闭完成，调用方继续跳转/返回动作；`Handled` = return() 抛错且
+    /// 异常已被外围 catch/finally 接管（unwind 已改写 pc），调用方须丢弃原完成动作；
+    /// `Suspended` = 异步关闭已登记挂起，调用方须早退（由结算闭包续）；`Err` = 无
+    /// 处理器，异常逃逸。
+    pub(crate) fn close_escaped_iters(&mut self, completion: Completion) -> Result<CloseEscapeOutcome, String> {
+        let for_in_count = completion.for_in_count();
+        let for_of_count = completion.for_of_count();
         for _ in 0..for_in_count {
             self.iters.pop_for_in();
         }
+        // 单层路径：首个异步条目登记关闭，其余异步条目丢弃（多层路径填 remaining）。
+        let mut first_async: Option<JsValue> = None;
         for _ in 0..for_of_count {
             let Some(entry) = self.iters.pop_for_of() else {
                 break;
             };
-            // 异步迭代器不在此关闭：for-await-of 的逃出（labeled/return）由
-            // 异步关闭机制处理，此处同步关闭会跳过 return() promise 的等待。
             if entry.is_async {
+                if first_async.is_none() {
+                    first_async = Some(entry.iterator);
+                }
                 continue;
             }
             let pc_before = self.pc;
@@ -973,9 +981,74 @@ impl Vm {
             // 在途异常等 finally 穿越。正常关闭时 pc 不变（call_function_sync 保存
             // 并恢复调用方 pc）。
             if self.pc != pc_before || self.pending_exception.is_some() {
-                return Ok(false);
+                return Ok(CloseEscapeOutcome::Handled);
             }
         }
+        if let Some(iterator) = first_async {
+            match self.register_async_escape_close(iterator, completion, Vec::new()) {
+                Ok(true) => {
+                    self.async_suspended = true;
+                    return Ok(CloseEscapeOutcome::Suspended);
+                }
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(CloseEscapeOutcome::Done)
+    }
+
+    /// 登记逃出 for-await-of 的异步关闭：同步调 return() 得 promise，登记结算闭包，
+    /// 置 pending_async_escape。迭代器无 return 方法时不登记（完成直接继续）。
+    ///
+    /// # 返回值
+    /// `Ok(true)` = 已登记挂起；`Ok(false)` = 无 return 方法，无需挂起；`Err` = 关闭
+    /// 过程出错。
+    fn register_async_escape_close(
+        &mut self, iterator: JsValue, completion: Completion, remaining: Vec<JsValue>,
+    ) -> Result<bool, String> {
+        // 异步生成器走独立状态盒（AsyncGeneratorState），本路径的结算闭包按
+        // AsyncState 恢复——不登记挂起（异步迭代器保持既有跳过行为，完成直接继续）。
+        if self.async_gen_dispatch {
+            return Ok(false);
+        }
+        if !iterator.is_object() {
+            return Ok(false);
+        }
+        let iter_obj = unsafe { &*iterator.as_js_object_ptr() };
+        let return_si = self.kernel_core.perm_interner().intern("return").0;
+        let return_fn = self.ordinary_get(iter_obj, return_si, iterator)?;
+        if !return_fn.is_object() || !unsafe { &*return_fn.as_js_object_ptr() }.is_function() {
+            return Ok(false);
+        }
+        let inner = match self.call_function_sync(return_fn, iterator, &[]) {
+            Ok(v) => v,
+            // return() 抛出：恢复原始异常值并展开，使外围 try/catch 可捕获。
+            Err(e) => return self.raise_call_error(&e).map(|_| false),
+        };
+        let promise = if self.is_promise_value(inner) {
+            inner
+        } else {
+            match self.promise_resolve(inner) {
+                Ok(p) => p,
+                Err(exc) => {
+                    let (p, _, _) = self.new_promise_capability();
+                    let _ = self.reject_promise(p, exc);
+                    p
+                }
+            }
+        };
+        // 同步生成器无异步上下文：不登记挂起（异步迭代器保持既有跳过行为，完成直接继续）。
+        let Some(ctx) = self.async_context.or(self.async_gen_context) else {
+            return Ok(false);
+        };
+        let fulfill_fn = self.make_async_escape_close_fn(ctx, promise, false);
+        let reject_fn = self.make_async_escape_close_fn(ctx, promise, true);
+        let _ = self.perform_promise_then(promise, fulfill_fn, reject_fn);
+        self.pending_async_escape = Some(PendingAsyncEscape {
+            close_promise: promise,
+            completion,
+            remaining,
+        });
         Ok(true)
     }
 

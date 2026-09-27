@@ -62,6 +62,16 @@ impl Vm {
         f(self.delegated_iterator.unwrap_or(JsValue::undefined()));
         f(self.async_context.unwrap_or(JsValue::undefined()));
         f(self.async_gen_context.unwrap_or(JsValue::undefined()));
+        // 在途异步逃出的 promise/完成值/剩余迭代器都是 GC 根。
+        if let Some(pend) = &self.pending_async_escape {
+            f(pend.close_promise);
+            if let Completion::Return { value, .. } = pend.completion {
+                f(value);
+            }
+            for &v in &pend.remaining {
+                f(v);
+            }
+        }
         f(self.inline_callee.unwrap_or(JsValue::undefined()));
         // 标签模板对象缓存：命中的模板对象是 GC 根（未根 → sweep 搬移/回收悬垂）。
         for &cached in self.template_objects.values() {
@@ -148,6 +158,28 @@ impl Vm {
         self.delegated_iterator = self.delegated_iterator.map(&mut rewrite);
         self.async_context = self.async_context.map(&mut rewrite);
         self.async_gen_context = self.async_gen_context.map(&mut rewrite);
+        // 在途异步逃出的 promise/完成值/剩余迭代器随 sweep 重写（与 mark 段一一对应）。
+        self.pending_async_escape = self.pending_async_escape.as_mut().map(|pend| {
+            let completion = match pend.completion {
+                Completion::Return {
+                    value,
+                    remaining_finally,
+                    for_of_count,
+                    for_in_count,
+                } => Completion::Return {
+                    value: rewrite(value),
+                    remaining_finally,
+                    for_of_count,
+                    for_in_count,
+                },
+                other => other,
+            };
+            super::PendingAsyncEscape {
+                close_promise: rewrite(pend.close_promise),
+                completion,
+                remaining: pend.remaining.iter().copied().map(&mut rewrite).collect(),
+            }
+        });
         self.inline_callee = self.inline_callee.map(&mut rewrite);
         for entry in &mut self.iters.for_of_iters {
             entry.iterator = rewrite(entry.iterator);

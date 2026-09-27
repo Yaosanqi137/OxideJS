@@ -323,6 +323,9 @@ impl Vm {
     ///   （`n_registers ≤ 254`，含 RegAlloc 最高合法物理槽 253）。
     pub(crate) fn save_inline_state(&mut self, regs_end: usize) -> Box<InlineSyncState> {
         vm_trace!("save_inline_state: pc={} depth={}", self.pc, self.frames.len());
+        // 固化不变量：内联 state-swap 边界不携带在途异步逃出（挂起态快照前已搬入
+        // 状态盒，settle 前恒为 None）。
+        debug_assert!(self.pending_async_escape.is_none());
         let window = regs_end.min(254);
         let mut window_regs = self.inline_reg_pool.take().unwrap_or_default();
         window_regs.clear();
@@ -335,6 +338,8 @@ impl Vm {
     /// 单回，窗口外寄存器 callee 未触碰无需恢复。
     pub(crate) fn restore_inline_state(&mut self, saved: Box<InlineSyncState>) {
         vm_trace!("restore_inline_state: pc={}", saved.pc);
+        // 固化不变量：内联 state-swap 边界不携带在途异步逃出（与 save 侧同）。
+        debug_assert!(self.pending_async_escape.is_none());
         let vm = self;
         let _window_regs: Vec<JsValue> = Vec::new();
         inline_core_fields!(vm, saved, inline_restore, _window_regs);
