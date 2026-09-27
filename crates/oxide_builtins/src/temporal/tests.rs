@@ -78,16 +78,16 @@ fn calendar_id_slot_fallback() {
 fn start_of_day_epoch_ns_instant_range() {
     // 当地午夜回推 epoch 越 Instant 界（±MAX）返回 None，供 startOfDay/hoursInDay RangeError 依据。
     // -100000001 天 + 1h < -MAX → 越界。
-    assert_eq!(start_of_day_epoch_ns(-271_821, 4, 19, -60), None);
+    assert_eq!(start_of_day_epoch_ns(-271_821, 4, 19, -3600), None);
     // -100000000 天（-271821-04-20）UTC 当地午夜恰为 -MAX，在边界内。
     assert_eq!(start_of_day_epoch_ns(-271_821, 4, 20, 0), Some(-8_640_000_000_000_000_000_000));
     // 同日期 +1h 偏移使当地午夜 -MAX - 1h 越界。
-    assert_eq!(start_of_day_epoch_ns(-271_821, 4, 20, 60), None);
+    assert_eq!(start_of_day_epoch_ns(-271_821, 4, 20, 3600), None);
     // 明日边界越界：+100000001 天（UTC）。
     assert_eq!(start_of_day_epoch_ns_by_days(100_000_001, 0), None);
     // 正常日期返回当地午夜。
     assert_eq!(start_of_day_epoch_ns(1970, 1, 1, 0), Some(0));
-    assert_eq!(start_of_day_epoch_ns(1970, 1, 1, 60), Some(-3_600_000_000_000));
+    assert_eq!(start_of_day_epoch_ns(1970, 1, 1, 3600), Some(-3_600_000_000_000));
 }
 
 #[test]
@@ -104,20 +104,20 @@ fn format_time_zone_annotation_normalizes_offset() {
 #[test]
 fn format_zoned_date_time_iso_annotations() {
     // 偏移/时区/日历注解各取值组合，验证段序 `{offset}[{tz}][{ca}]` 与 critical 前缀。
-    let base = format_zoned_date_time_iso(0, 60, "+01:00", "iso8601", true, None, "auto", "auto", "auto");
+    let base = format_zoned_date_time_iso(0, 3600, "+01:00", "iso8601", true, None, "auto", "auto", "auto");
     assert_eq!(base, Some("1970-01-01T01:00:00+01:00[+01:00]".to_string()));
     // offset never 省略偏移段，时区注解仍显示。
-    let no_offset = format_zoned_date_time_iso(0, 60, "+01:00", "iso8601", true, None, "never", "auto", "auto");
+    let no_offset = format_zoned_date_time_iso(0, 3600, "+01:00", "iso8601", true, None, "never", "auto", "auto");
     assert_eq!(no_offset, Some("1970-01-01T01:00:00[+01:00]".to_string()));
     // calendarName always 追加日历注解。
-    let ca_always = format_zoned_date_time_iso(0, 60, "+01:00", "iso8601", true, None, "auto", "auto", "always");
+    let ca_always = format_zoned_date_time_iso(0, 3600, "+01:00", "iso8601", true, None, "auto", "auto", "always");
     assert_eq!(ca_always, Some("1970-01-01T01:00:00+01:00[+01:00][u-ca=iso8601]".to_string()));
     // timeZoneName/calendarName critical 均 `!` 置于括号内。
-    let critical = format_zoned_date_time_iso(0, 60, "+01:00", "iso8601", true, None, "auto", "critical", "critical");
+    let critical = format_zoned_date_time_iso(0, 3600, "+01:00", "iso8601", true, None, "auto", "critical", "critical");
     assert_eq!(critical, Some("1970-01-01T01:00:00+01:00[!+01:00][!u-ca=iso8601]".to_string()));
     // offset critical 偏移段前加 !。
     let offset_critical =
-        format_zoned_date_time_iso(0, 60, "+01:00", "iso8601", true, None, "critical", "auto", "auto");
+        format_zoned_date_time_iso(0, 3600, "+01:00", "iso8601", true, None, "critical", "auto", "auto");
     assert_eq!(offset_critical, Some("1970-01-01T01:00:00!+01:00[+01:00]".to_string()));
 }
 
@@ -132,14 +132,17 @@ fn format_zoned_date_time_iso_epoch_rounding_cross_midnight() {
 #[test]
 fn local_to_epoch_ns_roundtrip() {
     // 与 parse_instant_string 互逆对拍：同一时刻的本地分量 + 偏移换算回 epoch 一致。
-    assert_eq!(parse_instant_string("2024-01-01T00:00:00+01:00"), local_to_epoch_ns(2024, 1, 1, 0.0, 60),);
+    assert_eq!(
+        parse_instant_string("2024-01-01T00:00:00+01:00"),
+        local_to_epoch_ns(2024, 1, 1, 0.0, 3600),
+    );
     assert_eq!(
         parse_instant_string("1969-07-16T13:32:01.234567891Z"),
         local_to_epoch_ns(1969, 7, 16, 48_721_234_567_891.0, 0),
     );
     // startOfDay 最小边界：-271821-04-20 加 1h 再回推 1h 偏移回到 -MAX。
     assert_eq!(
-        local_to_epoch_ns(-271821, 4, 20, 3_600_000_000_000.0, 60),
+        local_to_epoch_ns(-271821, 4, 20, 3_600_000_000_000.0, 3600),
         Some(-8_640_000_000_000_000_000_000),
     );
 }
@@ -161,14 +164,35 @@ fn zoned_date_time_string_wall_day_range_boundary() {
 
 #[test]
 fn canonical_time_zone_4_digit_offset() {
-    // ±HHMM 无冒号形式归一：ID 保留原串，offset 分钟数正确换算。
+    // ±HHMM 无冒号形式归一：ID 保留原串，offset 秒数正确换算。
     assert_eq!(canonical_time_zone("+0000"), Some(("+0000".to_string(), 0)));
-    assert_eq!(canonical_time_zone("-0530"), Some(("-0530".to_string(), -330)));
-    assert_eq!(canonical_time_zone("+2330"), Some(("+2330".to_string(), 1410)));
+    assert_eq!(canonical_time_zone("-0530"), Some(("-0530".to_string(), -19800)));
+    assert_eq!(canonical_time_zone("+2330"), Some(("+2330".to_string(), 84600)));
     // 非法分钟/小时拒绝。
     assert_eq!(canonical_time_zone("+2400"), None);
     assert_eq!(canonical_time_zone("+0060"), None);
     assert_eq!(canonical_time_zone("+123"), None); // 长度不符
+}
+
+#[test]
+fn offset_seconds_representation_sub_minute() {
+    // i64 秒表示保留亚分钟偏移（±HH:MM:SS 秒位），旧分钟表示丢弃秒位。
+    assert_eq!(parse_any_offset_seconds("+00:44:30"), Some(2670));
+    assert_eq!(parse_any_offset_seconds("-00:44:30"), Some(-2670));
+    assert_eq!(parse_any_offset_seconds("+01:00:00"), Some(3600));
+    assert_eq!(parse_any_offset_seconds("-23:59:59"), Some(-(23 * 3600 + 59 * 60 + 59)));
+    // 固定偏移秒值与分钟值 ×60 一致（±HH:MM 六字符形）。
+    assert_eq!(canonical_time_zone("+01:00"), Some(("+01:00".to_string(), 3600)));
+    assert_eq!(canonical_time_zone("-05:30"), Some(("-05:30".to_string(), -19800)));
+    // 亚分钟偏移经 local_to_epoch_ns 与 parse_instant_string 互逆对拍。
+    assert_eq!(
+        parse_instant_string("2024-01-01T00:00:00-00:44:30"),
+        local_to_epoch_ns(2024, 1, 1, 0.0, -2670),
+    );
+    assert_eq!(
+        parse_instant_string("2024-01-01T00:00:00+00:44:30"),
+        local_to_epoch_ns(2024, 1, 1, 0.0, 2670),
+    );
 }
 
 #[test]
@@ -275,15 +299,15 @@ fn zoned_date_time_round_else_path_epoch() {
     let quantum = 3_600_000_000_000 * 4;
     let rounded = round_instant_ns(55_410_123_456_789, quantum, InstantRoundingMode::HalfExpand).unwrap();
     assert_eq!(rounded, 57_600_000_000_000);
-    // 本地墙钟日回推：offset 60 分，local_to_epoch_ns 得目标 epoch。
-    let epoch = local_to_epoch_ns(1976, 11, 18, rounded as f64, 60).unwrap();
+    // 本地墙钟日回推：offset 3600 秒，local_to_epoch_ns 得目标 epoch。
+    let epoch = local_to_epoch_ns(1976, 11, 18, rounded as f64, 3600).unwrap();
     assert_eq!(epoch, 217_177_200_000_000_000);
 }
 
 #[test]
 fn zoned_date_time_round_day_path_epoch() {
-    // 同日本地午夜 startNs（2513 天，offset 60 分），dayProgress 舍到次日 → 217206000000000000。
-    let start_ns = start_of_day_epoch_ns(1976, 11, 18, 60).unwrap();
+    // 同日本地午夜 startNs（2513 天，offset 3600 秒），dayProgress 舍到次日 → 217206000000000000。
+    let start_ns = start_of_day_epoch_ns(1976, 11, 18, 3600).unwrap();
     assert_eq!(start_ns, 217_119_600_000_000_000);
     let day_progress = 217_175_010_123_456_789 - start_ns;
     let rounded = round_instant_ns(day_progress, 86_400_000_000_000, InstantRoundingMode::HalfExpand).unwrap();

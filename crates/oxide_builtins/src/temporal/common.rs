@@ -641,7 +641,7 @@ pub(crate) fn parse_fractional_second_digits<H: VmHost>(
     }
 }
 
-pub(crate) fn parse_offset_minutes(value: &str) -> Option<i32> {
+pub(crate) fn parse_offset_seconds(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() != 6 || !matches!(bytes[0], b'+' | b'-') || bytes[3] != b':' {
         return None;
@@ -649,21 +649,21 @@ pub(crate) fn parse_offset_minutes(value: &str) -> Option<i32> {
     if !bytes[1..3].iter().all(u8::is_ascii_digit) || !bytes[4..6].iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let hours = i32::from(bytes[1] - b'0') * 10 + i32::from(bytes[2] - b'0');
-    let minutes = i32::from(bytes[4] - b'0') * 10 + i32::from(bytes[5] - b'0');
+    let hours = i64::from(bytes[1] - b'0') * 10 + i64::from(bytes[2] - b'0');
+    let minutes = i64::from(bytes[4] - b'0') * 10 + i64::from(bytes[5] - b'0');
     if hours > 23 || minutes > 59 {
         return None;
     }
-    let magnitude = hours * 60 + minutes;
+    let magnitude = hours * 3600 + minutes * 60;
     Some(if bytes[0] == b'-' { -magnitude } else { magnitude })
 }
 
-pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i32)> {
+pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i64)> {
     let input = value.trim();
     if input.eq_ignore_ascii_case("UTC") || input.eq_ignore_ascii_case("Z") {
         return Some(("UTC".to_string(), 0));
     }
-    if let Some(offset) = parse_offset_minutes(input) {
+    if let Some(offset) = parse_offset_seconds(input) {
         return Some((input.to_string(), offset));
     }
 
@@ -672,10 +672,10 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i32)> {
         && matches!(input.as_bytes()[0], b'+' | b'-')
         && input.as_bytes()[1..3].iter().all(u8::is_ascii_digit)
     {
-        let hour = (input.as_bytes()[1] - b'0') as i32 * 10 + (input.as_bytes()[2] - b'0') as i32;
+        let hour = (input.as_bytes()[1] - b'0') as i64 * 10 + (input.as_bytes()[2] - b'0') as i64;
         if hour <= 23 {
             let sign = if input.as_bytes()[0] == b'-' { -1 } else { 1 };
-            return Some((input.to_string(), sign * hour * 60));
+            return Some((input.to_string(), sign * hour * 3600));
         }
         return None;
     }
@@ -685,11 +685,11 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i32)> {
         && matches!(input.as_bytes()[0], b'+' | b'-')
         && input.as_bytes()[1..5].iter().all(u8::is_ascii_digit)
     {
-        let hour = (input.as_bytes()[1] - b'0') as i32 * 10 + (input.as_bytes()[2] - b'0') as i32;
-        let minute = (input.as_bytes()[3] - b'0') as i32 * 10 + (input.as_bytes()[4] - b'0') as i32;
+        let hour = (input.as_bytes()[1] - b'0') as i64 * 10 + (input.as_bytes()[2] - b'0') as i64;
+        let minute = (input.as_bytes()[3] - b'0') as i64 * 10 + (input.as_bytes()[4] - b'0') as i64;
         if hour <= 23 && minute <= 59 {
             let sign = if input.as_bytes()[0] == b'-' { -1 } else { 1 };
-            return Some((input.to_string(), sign * (hour * 60 + minute)));
+            return Some((input.to_string(), sign * (hour * 3600 + minute * 60)));
         }
         return None;
     }
@@ -706,7 +706,7 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i32)> {
         if annotation.eq_ignore_ascii_case("UTC") {
             return Some(("UTC".to_string(), 0));
         }
-        return parse_offset_minutes(annotation).map(|offset| (annotation.to_string(), offset));
+        return parse_offset_seconds(annotation).map(|offset| (annotation.to_string(), offset));
     }
 
     let time_start = input.find(['T', 't', ' '])?;
@@ -719,7 +719,7 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i32)> {
         .rev()
         .find_map(|(index, ch)| matches!(ch, '+' | '-').then_some(index))?;
     let offset_id = &time[offset_start..];
-    parse_offset_minutes(offset_id).map(|offset| (offset_id.to_string(), offset))
+    parse_offset_seconds(offset_id).map(|offset| (offset_id.to_string(), offset))
 }
 
 pub(crate) fn civil_from_days(days: i128) -> (i128, i128, i128) {
@@ -1162,11 +1162,11 @@ pub(crate) fn zoned_date_time_plain_parts<H: VmHost>(
         return Err(crate::error::create_range_error(vm, "invalid ZonedDateTime"));
     };
     let time_zone_id = to_string(obj.get_prop_at(1));
-    let Some(offset_minutes) = instant_time_zone_offset(&time_zone_id) else {
+    let Some(offset_seconds) = instant_time_zone_offset(&time_zone_id) else {
         return Err(crate::error::create_range_error(vm, "invalid time zone"));
     };
     const DAY_NS: i128 = 86_400_000_000_000;
-    let local_ns = epoch_ns + i128::from(offset_minutes) * 60_000_000_000;
+    let local_ns = epoch_ns + i128::from(offset_seconds) * 1_000_000_000;
     let days = local_ns.div_euclid(DAY_NS);
     let time_ns = local_ns.rem_euclid(DAY_NS) as f64;
     let (year, month, day) = civil_from_days(days);
@@ -1176,16 +1176,16 @@ pub(crate) fn zoned_date_time_plain_parts<H: VmHost>(
     Ok((year as i32, month as u32, day as u32, time_ns))
 }
 
-/// 本地墙钟分量 + 时区偏移（分钟）→ 纪元纳秒（zoned_date_time_plain_parts 的逆）。
+/// 本地墙钟分量 + 时区偏移（秒）→ 纪元纳秒（zoned_date_time_plain_parts 的逆）。
 ///
 /// # 边界与前提
 /// - (year, month, day, time_ns) 须已通过 valid_iso_date / valid_plain_time 校验（调用方保证）。
 /// - 仅做 checked 溢出防护，Instant 范围校验由调用方按需执行。
-pub(crate) fn local_to_epoch_ns(year: i32, month: u32, day: u32, time_ns: f64, offset_minutes: i32) -> Option<i128> {
+pub(crate) fn local_to_epoch_ns(year: i32, month: u32, day: u32, time_ns: f64, offset_seconds: i64) -> Option<i128> {
     let days = days_from_civil(i128::from(year), i128::from(month), i128::from(day));
     days.checked_mul(86_400_000_000_000)?
         .checked_add(time_ns as i128)?
-        .checked_sub(i128::from(offset_minutes) * 60_000_000_000)
+        .checked_sub(i128::from(offset_seconds) * 1_000_000_000)
 }
 
 pub(crate) fn make_plain_date<H: VmHost>(vm: &mut H, year: i32, month: u32, day: u32, calendar: &str) -> NativeResult {

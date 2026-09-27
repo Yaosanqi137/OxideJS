@@ -16,7 +16,7 @@ use super::difference::{
     nudge_window, plain_date_time_unit_index, round_instant_difference, DifferenceSettings, DAY_NS, MAX_ISO_DAY,
 };
 use super::instant::{instant_rounding_mode, instant_time_zone_offset, InstantRoundingMode};
-use super::zoned_date_time::{parse_any_offset_minutes, valid_offset_fraction, zoned_date_time_string_parts};
+use super::zoned_date_time::{parse_any_offset_seconds, valid_offset_fraction, zoned_date_time_string_parts};
 use super::{make_duration, parse_plain_date_time_string};
 
 fn parse_duration_string(input: &str) -> Option<[f64; 10]> {
@@ -310,8 +310,8 @@ fn duration_relative_to_date<H: VmHost>(
         // （canonical_time_zone 拒 IANA），可解析的带注解串已被 plain 首支接受。
         // 按 instant 解析 + 注解时区反推墙钟日期。
         let (epoch_ns, time_zone_id, _calendar) = zoned_date_time_string_parts(vm, &text, "reject")?;
-        let offset_minutes = instant_time_zone_offset(&time_zone_id).unwrap_or(0);
-        let wall_ns = epoch_ns + i128::from(offset_minutes) * 60_000_000_000;
+        let offset_seconds = instant_time_zone_offset(&time_zone_id).unwrap_or(0);
+        let wall_ns = epoch_ns + i128::from(offset_seconds) * 1_000_000_000;
         let (year, month, day) = civil_from_days(wall_ns.div_euclid(DAY_NS));
         return Ok(Some((year, month, day)));
     }
@@ -363,7 +363,7 @@ fn duration_relative_to_date<H: VmHost>(
             return Err(crate::error::create_type_error(vm, "invalid offset"));
         }
         let offset_input = to_string(offset_raw);
-        if parse_any_offset_minutes(&offset_input).is_none() || !valid_offset_fraction(&offset_input) {
+        if parse_any_offset_seconds(&offset_input).is_none() || !valid_offset_fraction(&offset_input) {
             return Err(crate::error::create_range_error(vm, "invalid offset"));
         }
     }

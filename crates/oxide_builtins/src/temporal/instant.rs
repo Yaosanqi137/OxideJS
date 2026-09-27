@@ -727,15 +727,15 @@ pub fn instant_since<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     instant_difference(vm, args, true)
 }
 
-pub(crate) fn instant_time_zone_offset(value: &str) -> Option<i32> {
+pub(crate) fn instant_time_zone_offset(value: &str) -> Option<i64> {
     canonical_time_zone(value).map(|(_, offset)| offset)
 }
 
 fn format_instant_iso(
-    epoch_ns: i128, offset_minutes: Option<i32>, include_seconds: bool, fractional_digits: Option<usize>,
+    epoch_ns: i128, offset_seconds: Option<i64>, include_seconds: bool, fractional_digits: Option<usize>,
 ) -> Option<String> {
     const DAY_NS: i128 = 86_400_000_000_000;
-    let offset_ns = i128::from(offset_minutes.unwrap_or(0)).checked_mul(60_000_000_000)?;
+    let offset_ns = i128::from(offset_seconds.unwrap_or(0)).checked_mul(1_000_000_000)?;
     let local_ns = epoch_ns.checked_add(offset_ns)?;
     let days = local_ns.div_euclid(DAY_NS);
     let mut time_ns = local_ns.rem_euclid(DAY_NS);
@@ -766,10 +766,10 @@ fn format_instant_iso(
         }
     }
 
-    if let Some(offset) = offset_minutes {
+    if let Some(offset) = offset_seconds {
         let sign = if offset < 0 { '-' } else { '+' };
         let magnitude = offset.abs();
-        output.push_str(&format!("{sign}{:02}:{:02}", magnitude / 60, magnitude % 60));
+        output.push_str(&format!("{sign}{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60));
     } else {
         output.push('Z');
     }
@@ -850,7 +850,7 @@ pub fn instant_to_string<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
             None => (1, true, None),
         },
     };
-    let offset_minutes = if time_zone_raw.is_undefined() {
+    let offset_seconds = if time_zone_raw.is_undefined() {
         None
     } else {
         if !time_zone_raw.is_string() {
@@ -868,7 +868,7 @@ pub fn instant_to_string<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     if rounded_ns.unsigned_abs() > MAX_INSTANT_NS as u128 {
         return NativeResult::Err(crate::error::create_range_error(vm, "Instant outside supported range"));
     }
-    match format_instant_iso(rounded_ns, offset_minutes, include_seconds, output_digits) {
+    match format_instant_iso(rounded_ns, offset_seconds, include_seconds, output_digits) {
         Some(output) => NativeResult::Ok(vm.new_string_owned(output)),
         None => NativeResult::Err(crate::error::create_range_error(vm, "invalid Instant")),
     }

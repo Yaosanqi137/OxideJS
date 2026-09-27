@@ -208,24 +208,24 @@ fn zoned_date_time_options<H: VmHost>(
     Ok((offset, disambiguation))
 }
 
-/// 从剥注解后的 Instant 主体提取字符串内数值偏移分钟数（±HH / ±HHMM / ±HH:MM / 亚秒形式）。
-/// Z/z 结尾视为 0 分钟；无偏移或偏移不可提取返回 None。
-fn extract_string_offset_minutes(body: &str) -> Option<i32> {
+/// 从剥注解后的 Instant 主体提取字符串内数值偏移秒数（±HH / ±HHMM / ±HH:MM / 亚秒形式）。
+/// Z/z 结尾视为 0 秒；无偏移或偏移不可提取返回 None。
+fn extract_string_offset_seconds(body: &str) -> Option<i64> {
     let time_start = body.find(['T', 't', ' '])?;
     let time = &body[time_start + 1..];
     let offset_start = time
         .char_indices()
         .rev()
         .find_map(|(index, ch)| matches!(ch, '+' | '-').then_some(index))?;
-    parse_any_offset_minutes(&time[offset_start..])
+    parse_any_offset_seconds(&time[offset_start..])
 }
 
-/// 解析数值偏移串（±HH / ±HHMM / ±HH:MM / ±HHMMSS / ±HH:MM:SS，可带小数秒）为分钟数。
-pub(crate) fn parse_any_offset_minutes(value: &str) -> Option<i32> {
+/// 解析数值偏移串（±HH / ±HHMM / ±HH:MM / ±HHMMSS / ±HH:MM:SS，可带小数秒）为秒数。
+pub(crate) fn parse_any_offset_seconds(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     let sign = match bytes.first() {
-        Some(b'+') => 1_i32,
-        Some(b'-') => -1_i32,
+        Some(b'+') => 1_i64,
+        Some(b'-') => -1_i64,
         _ => return None,
     };
     let mut cursor = 1usize;
@@ -256,7 +256,7 @@ pub(crate) fn parse_any_offset_minutes(value: &str) -> Option<i32> {
     if cursor != bytes.len() || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    Some(sign * (hour * 60 + minute) as i32)
+    Some((hour * 3600 + minute * 60 + second) as i64 * sign)
 }
 
 /// 从 ZDT 对象 / ISO 字符串 / property bag 解析 (epoch_ns, time_zone_id, calendar_id) 三元组。
@@ -316,15 +316,15 @@ pub(crate) fn zoned_date_time_string_parts<H: VmHost>(
         return Err(crate::error::create_range_error(vm, "invalid ISO 8601 date-time"));
     };
     let has_utc_designator = body.ends_with(['Z', 'z']);
-    let string_offset_minutes = if has_utc_designator { Some(0) } else { extract_string_offset_minutes(body) };
+    let string_offset_seconds = if has_utc_designator { Some(0) } else { extract_string_offset_seconds(body) };
 
     // 有偏移/Z 时经 parse_instant_string 得 epoch 并反推墙钟；否则直接解析墙钟。
     const DAY_NS: i128 = 86_400_000_000_000;
-    let (epoch_from_string, wall_parts) = if string_offset_minutes.is_some() {
+    let (epoch_from_string, wall_parts) = if string_offset_seconds.is_some() {
         let epoch_ns = parse_instant_string(input)
             .ok_or_else(|| crate::error::create_range_error(vm, "invalid ISO 8601 date-time"))?;
-        let offset_minutes = string_offset_minutes.unwrap_or(0);
-        let wall_ns = epoch_ns + i128::from(offset_minutes) * 60_000_000_000;
+        let offset_seconds = string_offset_seconds.unwrap_or(0);
+        let wall_ns = epoch_ns + i128::from(offset_seconds) * 1_000_000_000;
         let days = wall_ns.div_euclid(DAY_NS);
         let (year, month, day) = civil_from_days(days);
         (Some(epoch_ns), (year as i32, month as u32, day as u32, wall_ns.rem_euclid(DAY_NS) as f64))
@@ -340,14 +340,14 @@ pub(crate) fn zoned_date_time_string_parts<H: VmHost>(
         return Err(crate::error::create_range_error(vm, "date-time out of range"));
     }
     let wall_epoch =
-        |offset_minutes: i32| local_to_epoch_ns(wall_parts.0, wall_parts.1, wall_parts.2, wall_parts.3, offset_minutes);
+        |offset_seconds: i64| local_to_epoch_ns(wall_parts.0, wall_parts.1, wall_parts.2, wall_parts.3, offset_seconds);
 
     // 按 offsetBehaviour 决策：Z → exact（墙钟 epoch）；无偏移 → wall（墙钟 + 时区偏移）；
     // 有偏移 → 按 offset 选项在字符串偏移与时区偏移之间选择。
     let epoch_ns = if has_utc_designator {
         epoch_from_string
     } else {
-        match string_offset_minutes {
+        match string_offset_seconds {
             None => wall_epoch(time_zone_offset),
             Some(offset) => match offset_mode {
                 "use" => epoch_from_string,
@@ -401,7 +401,7 @@ fn zoned_date_time_bag_parts<H: VmHost>(
 
     // offset 可选：语法校验（ToOffsetString 语义）先于数值字段转换。
     let offset_raw = temporal_option_value(vm, obj, value, "offset")?;
-    let bag_offset_minutes = if offset_raw.is_undefined() {
+    let bag_offset_seconds = if offset_raw.is_undefined() {
         None
     } else {
         let offset_input = temporal_option_string(vm, offset_raw)?;
@@ -415,7 +415,7 @@ fn zoned_date_time_bag_parts<H: VmHost>(
     let (year, month, day, total_ns, calendar) = plain_date_time_object_parts(vm, value, obj, false, false)?;
 
     // 按 offset 选项决定 epoch（InterpretISODateTimeOffset 固定偏移简化：候选恒唯一）。
-    let epoch_ns = match (bag_offset_minutes, offset_mode) {
+    let epoch_ns = match (bag_offset_seconds, offset_mode) {
         (None, _) | (Some(_), "ignore") => local_to_epoch_ns(year, month, day, total_ns, time_zone_offset),
         (Some(offset), "use") => local_to_epoch_ns(year, month, day, total_ns, offset),
         (Some(offset), "prefer") => {
@@ -485,10 +485,10 @@ pub fn zoned_date_time_compare<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResu
 /// 时区注解文本：命名区原样返回，偏移区规范化为 `±HH:MM` 带冒号；critical 时 `!` 置于括号内。
 pub(crate) fn format_time_zone_annotation(time_zone_id: &str, critical: bool) -> String {
     let inner = if matches!(time_zone_id.as_bytes().first(), Some(b'+') | Some(b'-')) {
-        let offset_minutes = instant_time_zone_offset(time_zone_id).unwrap_or(0);
-        let sign = if offset_minutes < 0 { '-' } else { '+' };
-        let magnitude = offset_minutes.abs();
-        format!("{sign}{:02}:{:02}", magnitude / 60, magnitude % 60)
+        let offset_seconds = instant_time_zone_offset(time_zone_id).unwrap_or(0);
+        let sign = if offset_seconds < 0 { '-' } else { '+' };
+        let magnitude = offset_seconds.abs();
+        format!("{sign}{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60)
     } else {
         time_zone_id.to_string()
     };
@@ -507,11 +507,11 @@ pub(crate) fn format_time_zone_annotation(time_zone_id: &str, critical: bool) ->
 /// - 偏移段恒 `±HH:MM` 带冒号；时区注解命名区原样、偏移区规范化。
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn format_zoned_date_time_iso(
-    epoch_ns: i128, offset_minutes: i32, time_zone_id: &str, calendar_id: &str, include_seconds: bool,
+    epoch_ns: i128, offset_seconds: i64, time_zone_id: &str, calendar_id: &str, include_seconds: bool,
     output_digits: Option<usize>, offset_name: &str, time_zone_name: &str, calendar_name: &str,
 ) -> Option<String> {
     const DAY_NS: i128 = 86_400_000_000_000;
-    let offset_ns = i128::from(offset_minutes).checked_mul(60_000_000_000)?;
+    let offset_ns = i128::from(offset_seconds).checked_mul(1_000_000_000)?;
     let local_ns = epoch_ns.checked_add(offset_ns)?;
     let days = local_ns.div_euclid(DAY_NS);
     let mut time_ns = local_ns.rem_euclid(DAY_NS);
@@ -544,12 +544,12 @@ pub(crate) fn format_zoned_date_time_iso(
 
     // offset 段：auto/always 显示，never 省略，critical 段前加 !。
     if offset_name != "never" {
-        let sign = if offset_minutes < 0 { '-' } else { '+' };
-        let magnitude = offset_minutes.abs();
+        let sign = if offset_seconds < 0 { '-' } else { '+' };
+        let magnitude = offset_seconds.abs();
         if offset_name == "critical" {
             output.push('!');
         }
-        output.push_str(&format!("{sign}{:02}:{:02}", magnitude / 60, magnitude % 60));
+        output.push_str(&format!("{sign}{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60));
     }
 
     // timeZoneName 注解：auto 显示，never 省略，critical 时 `!` 置于括号内。
@@ -577,7 +577,7 @@ pub fn zoned_date_time_to_string<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeRe
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid ZonedDateTime"));
     };
     let time_zone_id = to_string(obj.get_prop_at(1));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
     let calendar_id = get_calendar_id(obj, 2);
     let options_value = if args.len() < 2 { JsValue::undefined() } else { vm.reg(args[1]) };
 
@@ -679,7 +679,7 @@ pub fn zoned_date_time_to_string<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeRe
     }
     match format_zoned_date_time_iso(
         rounded_ns,
-        offset_minutes,
+        offset_seconds,
         &time_zone_id,
         &calendar_id,
         include_seconds,
@@ -783,7 +783,7 @@ struct ZdtMergedFields {
     microsecond: f64,
     nanosecond: f64,
     month_code: Option<(f64, bool)>,
-    bag_offset: Option<i32>,
+    bag_offset: Option<i64>,
 }
 
 /// with 的部分字段读取与合并：按字典序读 bag 字段，与 receiver 默认分量合并。
@@ -791,7 +791,7 @@ struct ZdtMergedFields {
 /// # 步骤
 /// 1. 数值字段 ToNumber→trunc（NaN/±Inf RangeError，day 额外拒绝 <1）；monthCode/offset 走 ToString。
 /// 2. undefined 不覆盖；至少一个字段有定义否则 TypeError。
-/// 3. 返回合并后的原始分量（未钳制）+ monthCode 解析 + bag offset 分钟。
+/// 3. 返回合并后的原始分量（未钳制）+ monthCode 解析 + bag offset 秒。
 ///
 /// # 边界与前提
 /// - 调用方须先完成 RejectObjectWithCalendarOrTimeZone（calendar/timeZone 已拒绝）。
@@ -888,17 +888,17 @@ fn zoned_date_time_with_fields<H: VmHost>(
     };
 
     // offset 先经 ToString，再按偏移字符串语法校验（小数秒最多 9 位），解析出的
-    // 分钟数留给 offset 选项决策使用。
+    // 秒数留给 offset 选项决策使用。
     let bag_offset = if offset_raw.is_undefined() {
         None
     } else {
         let offset_input = temporal_string_strict(vm, offset_raw)?;
-        let minutes = parse_any_offset_minutes(&offset_input)
+        let seconds = parse_any_offset_seconds(&offset_input)
             .ok_or_else(|| crate::error::create_range_error(vm, "invalid offset"))?;
         if !valid_offset_fraction(&offset_input) {
             return Err(crate::error::create_range_error(vm, "invalid offset"));
         }
-        Some(minutes)
+        Some(seconds)
     };
 
     let (receiver_year, _receiver_month, receiver_day, receiver_time_ns) = defaults;
@@ -942,7 +942,7 @@ pub fn zoned_date_time_with<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult 
     native_try!(reject_partial_object_with_calendar_or_time_zone(vm, value));
 
     let time_zone_id = to_string(obj.get_prop_at(1));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
     let (year, month, day, time_ns) = native_try!(zoned_date_time_plain_parts(vm, obj));
     let merged = native_try!(zoned_date_time_with_fields(vm, value, (year, month, day, time_ns)));
 
@@ -1040,18 +1040,18 @@ pub fn zoned_date_time_with<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult 
 
     // InterpretISODateTimeOffset（固定偏移简化）：按 offset 选项在 bag 偏移与时区偏移间选择。
     let epoch_ns = match (merged.bag_offset, offset_mode.as_str()) {
-        (None, _) => local_to_epoch_ns(year, month, day, total_ns, offset_minutes),
+        (None, _) => local_to_epoch_ns(year, month, day, total_ns, offset_seconds),
         (Some(offset), "use") => local_to_epoch_ns(year, month, day, total_ns, offset),
-        (Some(_), "ignore") => local_to_epoch_ns(year, month, day, total_ns, offset_minutes),
+        (Some(_), "ignore") => local_to_epoch_ns(year, month, day, total_ns, offset_seconds),
         (Some(offset), "prefer") => {
-            if offset == offset_minutes {
+            if offset == offset_seconds {
                 local_to_epoch_ns(year, month, day, total_ns, offset)
             } else {
-                local_to_epoch_ns(year, month, day, total_ns, offset_minutes)
+                local_to_epoch_ns(year, month, day, total_ns, offset_seconds)
             }
         }
         (Some(offset), "reject") => {
-            if offset == offset_minutes {
+            if offset == offset_seconds {
                 local_to_epoch_ns(year, month, day, total_ns, offset)
             } else {
                 return NativeResult::Err(crate::error::create_range_error(vm, "offset and time zone disagree"));
@@ -1095,7 +1095,7 @@ pub fn zoned_date_time_with_calendar<H: VmHost>(vm: &mut H, args: &[u8]) -> Nati
     make_zoned_date_time(vm, epoch_ns, &time_zone_id, &calendar)
 }
 
-/// 校验 offset 串的小数秒位数 ≤9（parse_any_offset_minutes 不限制位数，此处补查）。
+/// 校验 offset 串的小数秒位数 ≤9（parse_any_offset_seconds 不限制位数，此处补查）。
 pub(crate) fn valid_offset_fraction(value: &str) -> bool {
     let Some(dot) = value.find(['.', ',']) else {
         return true;
@@ -1119,10 +1119,10 @@ pub fn zoned_date_time_with_plain_time<H: VmHost>(vm: &mut H, args: &[u8]) -> Na
     let obj = unsafe { &*ptr };
     native_try!(ensure_zoned_date_time(vm, obj));
     let (year, month, day, _) = native_try!(zoned_date_time_plain_parts(vm, obj));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
     let plain_time_like = if args.len() > 1 { vm.reg(args[1]) } else { JsValue::undefined() };
     let time_ns = native_try!(plain_time_like_ns(vm, plain_time_like));
-    let epoch_ns = local_to_epoch_ns(year, month, day, time_ns, offset_minutes)
+    let epoch_ns = local_to_epoch_ns(year, month, day, time_ns, offset_seconds)
         .ok_or_else(|| crate::error::create_range_error(vm, "invalid date-time"));
     let epoch_ns = native_try!(epoch_ns);
     if epoch_ns.unsigned_abs() > MAX_INSTANT_NS as u128 {
@@ -1207,9 +1207,9 @@ fn zoned_date_time_other_wall_epoch_ns<H: VmHost>(
     if !valid_iso_date(year, month, day) || !total_ns.is_finite() || !(0.0..86_400_000_000_000.0).contains(&total_ns) {
         return Err(crate::error::create_range_error(vm, "invalid date-time component"));
     }
-    let offset_minutes = instant_time_zone_offset(default_tz_id)
+    let offset_seconds = instant_time_zone_offset(default_tz_id)
         .ok_or_else(|| crate::error::create_range_error(vm, "invalid time zone"))?;
-    local_to_epoch_ns(year, month, day, total_ns, offset_minutes)
+    local_to_epoch_ns(year, month, day, total_ns, offset_seconds)
         .ok_or_else(|| crate::error::create_range_error(vm, "invalid date-time"))
 }
 
@@ -1236,7 +1236,7 @@ fn zoned_date_time_other_bag_epoch_ns<H: VmHost>(
     };
 
     let offset_raw = temporal_option_value(vm, obj, value, "offset")?;
-    let bag_offset_minutes = if offset_raw.is_undefined() {
+    let bag_offset_seconds = if offset_raw.is_undefined() {
         None
     } else {
         if !offset_raw.is_string() {
@@ -1250,7 +1250,7 @@ fn zoned_date_time_other_bag_epoch_ns<H: VmHost>(
     };
 
     let (year, month, day, total_ns, _calendar) = plain_date_time_object_parts(vm, value, obj, false, false)?;
-    if let Some(offset) = bag_offset_minutes {
+    if let Some(offset) = bag_offset_seconds {
         if offset != time_zone_offset {
             return Err(crate::error::create_range_error(vm, "offset and time zone disagree"));
         }
@@ -1279,7 +1279,7 @@ fn zoned_date_time_difference<H: VmHost>(vm: &mut H, args: &[u8], since: bool) -
     let Some(epoch_r) = get_instant_epoch_ns(obj) else {
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid ZonedDateTime"));
     };
-    let offset_min_r = native_try!(zoned_date_time_offset_minutes(vm, obj));
+    let offset_seconds_r = native_try!(zoned_date_time_offset_seconds(vm, obj));
     let time_zone_id = to_string(obj.get_prop_at(1));
     let (y_r, m_r, d_r, time_ns_r) = native_try!(zoned_date_time_plain_parts(vm, obj));
 
@@ -1293,7 +1293,7 @@ fn zoned_date_time_difference<H: VmHost>(vm: &mut H, args: &[u8], since: bool) -
 
     // other 按 receiver 时区偏移拆本地墙钟（负 epoch 用 div_euclid/rem_euclid 保持非负余数）。
     const DAY_NS: i128 = 86_400_000_000_000;
-    let local_ns_o = epoch_o + i128::from(offset_min_r) * 60_000_000_000;
+    let local_ns_o = epoch_o + i128::from(offset_seconds_r) * 1_000_000_000;
     let days_o = local_ns_o.div_euclid(DAY_NS);
     let (y_o, m_o, d_o) = civil_from_days(days_o);
     let time_ns_o = local_ns_o.rem_euclid(DAY_NS);
@@ -1342,7 +1342,7 @@ pub(crate) fn zoned_date_time_round_unit(value: &str) -> Option<(i128, i128)> {
 /// # 步骤
 /// 1. roundTo 解析：undefined → TypeError；字符串 → {smallestUnit: 串}；对象 → 依次 Get
 ///    roundingIncrement → roundingMode → smallestUnit，全部读完再统一校验。
-/// 2. receiver：ensure_zoned_date_time → epoch_r；instant_time_zone_offset(tz) 得 offset_min；
+/// 2. receiver：ensure_zoned_date_time → epoch_r；instant_time_zone_offset(tz) 得 offset_seconds；
 ///    zoned_date_time_plain_parts 得 (y, m, d, time_ns)。
 /// 3. 单位表查 smallestUnit（None → RangeError "invalid smallest unit"）。
 /// 4. roundingIncrement 校验：1..=1e9 且真因子（increment < units_per_day 且
@@ -1363,7 +1363,7 @@ pub fn zoned_date_time_round<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid ZonedDateTime"));
     };
     let time_zone_id = to_string(obj.get_prop_at(1));
-    let Some(offset_min) = instant_time_zone_offset(&time_zone_id) else {
+    let Some(offset_seconds) = instant_time_zone_offset(&time_zone_id) else {
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid time zone"));
     };
     let calendar_id = get_calendar_id(obj, 2);
@@ -1435,11 +1435,11 @@ pub fn zoned_date_time_round<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult
     const DAY_NS: i128 = 86_400_000_000_000;
     let result_ns = if unit_ns == DAY_NS {
         // day 路径：startNs/endNs 双算（越界 → RangeError），dayProgress 固定偏移下 ∈ [0, DAY)。
-        let start_ns = native_try!(start_of_day_epoch_ns(y, m, d, offset_min)
+        let start_ns = native_try!(start_of_day_epoch_ns(y, m, d, offset_seconds)
             .ok_or_else(|| crate::error::create_range_error(vm, "invalid start of day")));
         native_try!(start_of_day_epoch_ns_by_days(
             days_from_civil(i128::from(y), i128::from(m), i128::from(d)) + 1,
-            offset_min,
+            offset_seconds,
         )
         .ok_or_else(|| crate::error::create_range_error(vm, "invalid start of day")));
         let day_progress = epoch_r - start_ns;
@@ -1458,7 +1458,7 @@ pub fn zoned_date_time_round<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult
         let Some(rounded_time) = round_instant_ns(time_ns as i128, quantum_ns, mode) else {
             return NativeResult::Err(crate::error::create_range_error(vm, "ZonedDateTime outside supported range"));
         };
-        let Some(result) = local_to_epoch_ns(y, m, d, rounded_time as f64, offset_min) else {
+        let Some(result) = local_to_epoch_ns(y, m, d, rounded_time as f64, offset_seconds) else {
             return NativeResult::Err(crate::error::create_range_error(vm, "ZonedDateTime outside supported range"));
         };
         result
@@ -1569,30 +1569,30 @@ zoned_date_time_brand_only_getter!(zoned_date_time_months_in_year, JsValue::floa
 zoned_date_time_brand_only_getter!(zoned_date_time_era, JsValue::undefined());
 zoned_date_time_brand_only_getter!(zoned_date_time_era_year, JsValue::undefined());
 
-/// 读 ZDT 时区偏移（分钟）；槽 1 解析失败返回 RangeError。调用方须先 ensure_zoned_date_time。
-fn zoned_date_time_offset_minutes<H: VmHost>(vm: &mut H, obj: &JsObject) -> Result<i32, JsValue> {
+/// 读 ZDT 时区偏移（秒）；槽 1 解析失败返回 RangeError。调用方须先 ensure_zoned_date_time。
+fn zoned_date_time_offset_seconds<H: VmHost>(vm: &mut H, obj: &JsObject) -> Result<i64, JsValue> {
     let time_zone_id = to_string(obj.get_prop_at(1));
     instant_time_zone_offset(&time_zone_id).ok_or_else(|| crate::error::create_range_error(vm, "invalid time zone"))
 }
 
-/// `Temporal.ZonedDateTime.prototype.offset`：由偏移分钟数规范化为 ±HH:MM 字符串。
+/// `Temporal.ZonedDateTime.prototype.offset`：由偏移秒数规范化为 ±HH:MM 字符串。
 pub fn zoned_date_time_offset<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let ptr = native_try!(receiver_obj(vm, args));
     let obj = unsafe { &*ptr };
     native_try!(ensure_zoned_date_time(vm, obj));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
-    let sign = if offset_minutes < 0 { '-' } else { '+' };
-    let magnitude = offset_minutes.abs();
-    NativeResult::Ok(vm.new_string(&format!("{sign}{:02}:{:02}", magnitude / 60, magnitude % 60)))
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let magnitude = offset_seconds.abs();
+    NativeResult::Ok(vm.new_string(&format!("{sign}{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60)))
 }
 
-/// `Temporal.ZonedDateTime.prototype.offsetNanoseconds`：偏移分钟数换算纳秒（f64 精确域内）。
+/// `Temporal.ZonedDateTime.prototype.offsetNanoseconds`：偏移秒数换算纳秒（f64 精确域内）。
 pub fn zoned_date_time_offset_nanoseconds<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     let ptr = native_try!(receiver_obj(vm, args));
     let obj = unsafe { &*ptr };
     native_try!(ensure_zoned_date_time(vm, obj));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
-    NativeResult::Ok(JsValue::float(offset_minutes as f64 * 60_000_000_000.0))
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
+    NativeResult::Ok(JsValue::float(offset_seconds as f64 * 1_000_000_000.0))
 }
 
 /// `Temporal.ZonedDateTime.prototype.monthCode`：ISO 日历下恒为 `M{month:02}` 补零格式。
@@ -1610,26 +1610,26 @@ pub fn zoned_date_time_hours_in_day<H: VmHost>(vm: &mut H, args: &[u8]) -> Nativ
     let obj = unsafe { &*ptr };
     native_try!(ensure_zoned_date_time(vm, obj));
     let (year, month, day, _) = native_try!(zoned_date_time_plain_parts(vm, obj));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
-    let today = native_try!(start_of_day_epoch_ns(year, month, day, offset_minutes)
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
+    let today = native_try!(start_of_day_epoch_ns(year, month, day, offset_seconds)
         .ok_or_else(|| crate::error::create_range_error(vm, "invalid date")));
     let days = days_from_civil(i128::from(year), i128::from(month), i128::from(day));
-    let tomorrow = native_try!(start_of_day_epoch_ns_by_days(days + 1, offset_minutes)
+    let tomorrow = native_try!(start_of_day_epoch_ns_by_days(days + 1, offset_seconds)
         .ok_or_else(|| crate::error::create_range_error(vm, "invalid date")));
     NativeResult::Ok(JsValue::float((tomorrow - today) as f64 / 3_600_000_000_000.0))
 }
 
 /// 求本地日期在给定时区偏移下的当地午夜纪元纳秒（GetStartOfDay 语义），
 /// 结果超出 Instant 范围时返回 None。
-pub(crate) fn start_of_day_epoch_ns(year: i32, month: u32, day: u32, offset_minutes: i32) -> Option<i128> {
-    start_of_day_epoch_ns_by_days(days_from_civil(i128::from(year), i128::from(month), i128::from(day)), offset_minutes)
+pub(crate) fn start_of_day_epoch_ns(year: i32, month: u32, day: u32, offset_seconds: i64) -> Option<i128> {
+    start_of_day_epoch_ns_by_days(days_from_civil(i128::from(year), i128::from(month), i128::from(day)), offset_seconds)
 }
 
 /// 按日数直接算当地午夜（hoursInDay 的明日边界复用：days+1 不经 civil 回填）。
-pub(crate) fn start_of_day_epoch_ns_by_days(days: i128, offset_minutes: i32) -> Option<i128> {
+pub(crate) fn start_of_day_epoch_ns_by_days(days: i128, offset_seconds: i64) -> Option<i128> {
     let start = days
         .checked_mul(86_400_000_000_000)?
-        .checked_sub(i128::from(offset_minutes) * 60_000_000_000)?;
+        .checked_sub(i128::from(offset_seconds) * 1_000_000_000)?;
     (start.unsigned_abs() <= MAX_INSTANT_NS as u128).then_some(start)
 }
 
@@ -1653,7 +1653,7 @@ fn zoned_date_time_apply_duration<H: VmHost>(vm: &mut H, args: &[u8], sign: i64)
     let obj = unsafe { &*ptr };
     native_try!(ensure_zoned_date_time(vm, obj));
     let time_zone_id = to_string(obj.get_prop_at(1));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
     let (year, month, day, time_ns) = match zoned_date_time_plain_parts(vm, obj) {
         Ok(parts) => parts,
         Err(error) => return NativeResult::Err(error),
@@ -1711,7 +1711,7 @@ fn zoned_date_time_apply_duration<H: VmHost>(vm: &mut H, args: &[u8], sign: i64)
     if !valid_plain_date_time_range(yy as i32, mm as u32, dd as u32, new_time_ns as f64) {
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid date-time"));
     }
-    let epoch_ns = match local_to_epoch_ns(yy as i32, mm as u32, dd as u32, new_time_ns as f64, offset_minutes) {
+    let epoch_ns = match local_to_epoch_ns(yy as i32, mm as u32, dd as u32, new_time_ns as f64, offset_seconds) {
         Some(epoch_ns) if epoch_ns.unsigned_abs() <= MAX_INSTANT_NS as u128 => epoch_ns,
         _ => return NativeResult::Err(crate::error::create_range_error(vm, "ZonedDateTime outside supported range")),
     };
@@ -1788,8 +1788,8 @@ pub fn zoned_date_time_start_of_day<H: VmHost>(vm: &mut H, args: &[u8]) -> Nativ
     let obj = unsafe { &*ptr };
     native_try!(ensure_zoned_date_time(vm, obj));
     let (year, month, day, _) = native_try!(zoned_date_time_plain_parts(vm, obj));
-    let offset_minutes = native_try!(zoned_date_time_offset_minutes(vm, obj));
-    let Some(epoch_ns) = start_of_day_epoch_ns(year, month, day, offset_minutes) else {
+    let offset_seconds = native_try!(zoned_date_time_offset_seconds(vm, obj));
+    let Some(epoch_ns) = start_of_day_epoch_ns(year, month, day, offset_seconds) else {
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid date"));
     };
     make_zoned_date_time(vm, epoch_ns, &to_string(obj.get_prop_at(1)), &get_calendar_id(obj, 2))
