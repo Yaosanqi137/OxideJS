@@ -324,3 +324,39 @@ fn t16_inner_next_sync_throw_thrown_into_body() {
         "\"caught:sync-e:true\""
     );
 }
+
+// T17：.return(v) 内层无 return 方法且请求值为 promise——规范 Await 步展开后
+// 以展开值完成（若引擎未 Await，r.value 为 promise 本身，字符串拼接形态不同）。
+#[test]
+fn t17_return_without_inner_return_awaits_promise_value() {
+    assert_eq!(
+        eval(
+            "async function* g() { yield* { [Symbol.asyncIterator]() { \
+             let first = true; return { \
+               next() { if (first) { first = false; return Promise.resolve({ value: 1, done: false }); } \
+                        return Promise.resolve({ done: true }); } }; } }; } \
+             (async function run() { const it = g(); await it.next(); \
+             const r = await it.return(Promise.resolve('v17')); return r.value + ':' + r.done; })()"
+        ),
+        "\"v17:true\""
+    );
+}
+
+// T18：.throw(e) 内层无 throw 方法且 close 结果非对象——抛 IteratorResult
+// TypeError 入 body（与同步路径消息一致），可 catch。
+#[test]
+fn t18_throw_close_non_object_result_typeerror() {
+    assert_eq!(
+        eval(
+            "async function* g() { try { yield* { [Symbol.asyncIterator]() { \
+             let first = true; return { \
+               next() { if (first) { first = false; return Promise.resolve({ value: 1, done: false }); } \
+                        return Promise.resolve({ done: true }); }, \
+               return() { return Promise.resolve(42); } }; } }; } \
+             catch (e) { return 'caught:' + e.message; } } \
+             (async function run() { const it = g(); await it.next(); \
+             const r = await it.throw('e18'); return r.value + ':' + r.done; })()"
+        ),
+        "\"caught:IteratorResult is not an object:true\""
+    );
+}
