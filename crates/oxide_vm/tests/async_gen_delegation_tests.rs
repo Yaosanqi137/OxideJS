@@ -386,3 +386,26 @@ fn t20_async_gen_break_escape_continues() {
         .to_string();
     assert_eq!(eval(&source), "\"body,close|after:false\"");
 }
+
+// T21：异步生成器多层逃出 + 中间夹一个普通异步函数的 return 恢复——多层结算循环
+// 置位的挂起信号不得泄漏进普通异步函数的 dispatch，普通异步函数不得被以 undefined
+// 误完成（return 穿越 finally 命中派发循环检查点，不得因陈旧信号提前返回）。时序：
+// g 的两轮结算（首轮逃出结算 + 多层结算循环）先于 f 的 await 恢复入队，f 恢复时体内
+// return 命中派发循环检查点。首轮结算入口已清信号，故陈旧信号必来自多层结算循环。
+#[test]
+fn t21_async_gen_multi_layer_escape_no_signal_leak_into_async_func() {
+    let source = "let log=[];\
+                  const mk=(n)=>({[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:n,done:false})},return(){log.push('c'+n);return Promise.resolve({done:true})}}}});\
+                  async function* g() { for await (const a of mk(1)) { for await (const b of mk(2)) { log.push('body'); return 42; } } }\
+                  let resolveF;\
+                  const PF = new Promise((res) => { resolveF = res; });\
+                  async function f() { await PF;\
+                    log.push('f-body');\
+                    try { return 'f-done'; } finally { log.push('f-finally'); } }\
+                  const pG = (async () => { const it = g(); const r = await it.next(); return 'g:' + r.done + ':' + r.value; })();\
+                  const pF = f();\
+                  Promise.resolve().then(() => {}).then(() => resolveF('x'));\
+                  Promise.all([pF, pG]).then(([fv, gv]) => log.join(',') + '|' + fv + '|' + gv)"
+        .to_string();
+    assert_eq!(eval(&source), "\"body,c2,c1,f-body,f-finally|f-done|g:true:42\"");
+}

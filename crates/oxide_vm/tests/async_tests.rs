@@ -379,6 +379,30 @@ fn for_await_of_escape_settlement_precedes_then() {
     assert_eq!(eval(&source), "\"body,after\"");
 }
 
+#[test]
+fn for_await_of_multi_layer_escape_no_signal_leak_into_async_gen() {
+    // 反向反例：普通异步函数多层逃出——多层结算循环置位的挂起信号不得泄漏进
+    // 异步生成器的 dispatch，异步生成器不得被以 undefined 误完成。时序：f 的两轮
+    // 结算（首轮逃出结算 + 多层结算循环）先于 g 的 await 恢复入队，g 恢复时体内
+    // return 穿越 finally 命中派发循环检查点。首轮结算入口已清信号，故陈旧信号
+    // 必来自多层结算循环。
+    let source = "let log=[];\
+                  const mk=(n)=>({[Symbol.asyncIterator](){return{next(){return Promise.resolve({value:n,done:false})},return(){log.push('c'+n);return Promise.resolve({done:true})}}}});\
+                  async function f() { for await (const a of mk(1)) { for await (const b of mk(2)) { log.push('f-body'); return 42; } } }\
+                  let resolveG;\
+                  const PG = new Promise((res) => { resolveG = res; });\
+                  async function* g() { await PG;\
+                    log.push('g-body');\
+                    try { return 'g-done'; } finally { log.push('g-finally'); } }\
+                  const pF = f();\
+                  const itG = g();\
+                  const pG1 = itG.next();\
+                  Promise.resolve().then(() => {}).then(() => resolveG('x'));\
+                  Promise.all([pF, pG1]).then(([fv, gv]) => log.join(',') + '|' + fv + '|' + gv.value + ':' + gv.done)"
+        .to_string();
+    assert_eq!(eval(&source), "\"f-body,c2,c1,g-body,g-finally|42|g-done:true\"");
+}
+
 // ── class/object 生成器方法（异步） ──
 
 // class async 生成器方法：yield 顺序与 done 收敛。顶层 then 链驱动

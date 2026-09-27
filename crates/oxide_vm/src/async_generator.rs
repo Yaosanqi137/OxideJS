@@ -861,11 +861,14 @@ impl Vm {
         };
 
         // 多层逃出：remaining 非空时逐层关闭（每层一轮结算），空了才执行完成
-        // （或抛拒绝原因）。挂起信号由 register 置位，快照后返回续下一轮结算。
+        // （或抛拒绝原因）。挂起信号由 register 置位，快照后返回续下一轮结算；
+        // 该信号由下一轮结算闭包消费、不经派发循环，须先清防陈旧信号泄漏进
+        // 另一上下文的 dispatch。
         while let Some(next_iter) = remaining.first().cloned() {
             remaining.remove(0);
             match self.register_async_escape_close(next_iter, completion, remaining.clone()) {
                 Ok(true) => {
+                    self.async_gen_suspended = false;
                     unsafe { (*state_ptr).phase = AsyncGenPhase::AwaitSuspended };
                     self.snapshot_async_generator(state_ptr)?;
                     self.restore_async_gen_flags(prev_ctx, prev_gen_ctx, prev_gd, prev_ad, prev_agd);
