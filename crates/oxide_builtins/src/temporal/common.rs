@@ -20,9 +20,10 @@ use oxide_runtime_api::{to_number, to_string, NativeResult, VmHost};
 use oxide_types::object::JsObject;
 use oxide_types::value::JsValue;
 
+use super::time_zone::{tz_canonical_name, zone_offset_seconds};
 use super::{
-    instant_time_zone_offset, parse_iso_date, parse_plain_date_time_string, parse_plain_time_string, valid_iso_date,
-    valid_plain_date_time_range, valid_plain_time,
+    parse_iso_date, parse_plain_date_time_string, parse_plain_time_string, valid_iso_date, valid_plain_date_time_range,
+    valid_plain_time,
 };
 
 pub(crate) const MAX_INSTANT_NS: i128 = 8_640_000_000_000_000_000_000;
@@ -658,13 +659,71 @@ pub(crate) fn parse_offset_seconds(value: &str) -> Option<i64> {
     Some(if bytes[0] == b'-' { -magnitude } else { magnitude })
 }
 
-pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i64)> {
+/// 数值偏移串统一解析为秒（±HH:MM / ±HH / ±HHMM / ±HH:MM:SS 四形式）。
+///
+/// # 边界与前提
+/// - 四形式以外的串（含带小数秒的 ±HH:MM:SS.xxx）返回 None。
+/// - 小时 ≤ 23、分钟/秒 ≤ 59，越界返回 None。
+pub(crate) fn fixed_offset_seconds(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    let sign = match bytes.first() {
+        Some(b'+') => 1_i64,
+        Some(b'-') => -1_i64,
+        _ => return None,
+    };
+    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+        if bytes[range.clone()].iter().all(u8::is_ascii_digit) {
+            Some(bytes[range].iter().map(|b| i64::from(b - b'0')).fold(0, |acc, d| acc * 10 + d))
+        } else {
+            None
+        }
+    };
+    // ±HH:MM（6 字符）：canonical_time_zone 接受面与 zone_offset_seconds 快速路径共用。
+    if bytes.len() == 6 && bytes[3] == b':' {
+        let hour = digits(1..3)?;
+        let minute = digits(4..6)?;
+        return (hour <= 23 && minute <= 59).then_some(sign * (hour * 3600 + minute * 60));
+    }
+    // ±HH（3 字符）：小时制简写，分钟恒 0。
+    if bytes.len() == 3 {
+        let hour = digits(1..3)?;
+        return (hour <= 23).then_some(sign * hour * 3600);
+    }
+    // ±HHMM（5 字符）：无冒号归一形式。
+    if bytes.len() == 5 {
+        let hour = digits(1..3)?;
+        let minute = digits(3..5)?;
+        return (hour <= 23 && minute <= 59).then_some(sign * (hour * 3600 + minute * 60));
+    }
+    // ±HH:MM:SS（9 字符）：亚分钟偏移，zone_offset_seconds 快速路径专用。
+    if bytes.len() == 9 && bytes[3] == b':' && bytes[6] == b':' {
+        let hour = digits(1..3)?;
+        let minute = digits(4..6)?;
+        let second = digits(7..9)?;
+        return (hour <= 23 && minute <= 59 && second <= 59).then_some(sign * (hour * 3600 + minute * 60 + second));
+    }
+    None
+}
+
+/// 时区标识符规范化：UTC/Z 归一为 "UTC"，数值偏移串原样保留，IANA 区名解别名后
+/// 返回规范名。
+///
+/// # 步骤
+/// 1. UTC/Z（大小写折叠）→ "UTC"。
+/// 2. 数值偏移串（±HH:MM / ±HH / ±HHMM）原样保留为时区 ID。
+/// 3. IANA 区名（含 legacy 别名）命中区表 → 规范名。
+/// 4. 带注解的日期时间以最后一个方括号内标识符为准；日期时间串尾偏移按偏移串处理。
+///
+/// # 边界与前提
+/// - 返回只含规范名，不含偏移：偏移是 epoch 的函数，由 zone_offset_seconds 统一提供。
+/// - 非法形式（越界小时/分钟、-000000 前缀、未知区名）返回 None。
+pub(crate) fn canonical_time_zone(value: &str) -> Option<String> {
     let input = value.trim();
     if input.eq_ignore_ascii_case("UTC") || input.eq_ignore_ascii_case("Z") {
-        return Some(("UTC".to_string(), 0));
+        return Some("UTC".to_string());
     }
-    if let Some(offset) = parse_offset_seconds(input) {
-        return Some((input.to_string(), offset));
+    if parse_offset_seconds(input).is_some() {
+        return Some(input.to_string());
     }
 
     // ±HH 基本偏移（"+01" / "-05"）：3 字符，hour ≤ 23，分钟恒 0。仅放宽构造器时区接受面。
@@ -674,8 +733,7 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i64)> {
     {
         let hour = (input.as_bytes()[1] - b'0') as i64 * 10 + (input.as_bytes()[2] - b'0') as i64;
         if hour <= 23 {
-            let sign = if input.as_bytes()[0] == b'-' { -1 } else { 1 };
-            return Some((input.to_string(), sign * hour * 3600));
+            return Some(input.to_string());
         }
         return None;
     }
@@ -688,13 +746,17 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i64)> {
         let hour = (input.as_bytes()[1] - b'0') as i64 * 10 + (input.as_bytes()[2] - b'0') as i64;
         let minute = (input.as_bytes()[3] - b'0') as i64 * 10 + (input.as_bytes()[4] - b'0') as i64;
         if hour <= 23 && minute <= 59 {
-            let sign = if input.as_bytes()[0] == b'-' { -1 } else { 1 };
-            return Some((input.to_string(), sign * (hour * 3600 + minute * 60)));
+            return Some(input.to_string());
         }
         return None;
     }
     if input.starts_with("-000000") {
         return None;
+    }
+
+    // IANA 区名（含 legacy 别名）：解别名后返回规范名。
+    if let Some(name) = tz_canonical_name(input) {
+        return Some(name.to_string());
     }
 
     // 带 annotation 的日期时间以最后一个方括号内标识符为准。
@@ -704,22 +766,25 @@ pub(crate) fn canonical_time_zone(value: &str) -> Option<(String, i64)> {
         }
         let annotation = &input[open + 1..input.len() - 1];
         if annotation.eq_ignore_ascii_case("UTC") {
-            return Some(("UTC".to_string(), 0));
+            return Some("UTC".to_string());
         }
-        return parse_offset_seconds(annotation).map(|offset| (annotation.to_string(), offset));
+        if parse_offset_seconds(annotation).is_some() {
+            return Some(annotation.to_string());
+        }
+        return tz_canonical_name(annotation).map(|name| name.to_string());
     }
 
     let time_start = input.find(['T', 't', ' '])?;
     let time = &input[time_start + 1..];
     if time.ends_with(['Z', 'z']) {
-        return Some(("UTC".to_string(), 0));
+        return Some("UTC".to_string());
     }
     let offset_start = time
         .char_indices()
         .rev()
         .find_map(|(index, ch)| matches!(ch, '+' | '-').then_some(index))?;
     let offset_id = &time[offset_start..];
-    parse_offset_seconds(offset_id).map(|offset| (offset_id.to_string(), offset))
+    parse_offset_seconds(offset_id).map(|_| offset_id.to_string())
 }
 
 pub(crate) fn civil_from_days(days: i128) -> (i128, i128, i128) {
@@ -1154,6 +1219,20 @@ pub(crate) fn temporal_calendar_id_strict<H: VmHost>(vm: &mut H, value: JsValue)
     temporal_calendar_id(vm, value)
 }
 
+/// 偏移秒数格式化为 `±HH:MM`；秒数非分钟整数倍时补秒段（`±HH:MM:SS`）。
+///
+/// # 边界与前提
+/// - 输入为有符号偏移秒（|offset| ≤ 24 小时），负值取绝对值后拼负号。
+pub(crate) fn format_offset_seconds_text(offset_seconds: i64) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let magnitude = offset_seconds.abs();
+    if magnitude % 60 != 0 {
+        format!("{sign}{:02}:{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60, magnitude % 60)
+    } else {
+        format!("{sign}{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60)
+    }
+}
+
 /// 将 ZonedDateTime 按时区偏移转换为本地 PlainDateTime 分量。
 pub(crate) fn zoned_date_time_plain_parts<H: VmHost>(
     vm: &mut H, obj: &JsObject,
@@ -1162,7 +1241,7 @@ pub(crate) fn zoned_date_time_plain_parts<H: VmHost>(
         return Err(crate::error::create_range_error(vm, "invalid ZonedDateTime"));
     };
     let time_zone_id = to_string(obj.get_prop_at(1));
-    let Some(offset_seconds) = instant_time_zone_offset(&time_zone_id) else {
+    let Some(offset_seconds) = zone_offset_seconds(&time_zone_id, epoch_ns.div_euclid(1_000_000_000) as i64) else {
         return Err(crate::error::create_range_error(vm, "invalid time zone"));
     };
     const DAY_NS: i128 = 86_400_000_000_000;

@@ -164,10 +164,10 @@ fn zoned_date_time_string_wall_day_range_boundary() {
 
 #[test]
 fn canonical_time_zone_4_digit_offset() {
-    // ±HHMM 无冒号形式归一：ID 保留原串，offset 秒数正确换算。
-    assert_eq!(canonical_time_zone("+0000"), Some(("+0000".to_string(), 0)));
-    assert_eq!(canonical_time_zone("-0530"), Some(("-0530".to_string(), -19800)));
-    assert_eq!(canonical_time_zone("+2330"), Some(("+2330".to_string(), 84600)));
+    // ±HHMM 无冒号形式归一：ID 保留原串（偏移秒值由 fixed_offset_seconds 单独提供）。
+    assert_eq!(canonical_time_zone("+0000"), Some("+0000".to_string()));
+    assert_eq!(canonical_time_zone("-0530"), Some("-0530".to_string()));
+    assert_eq!(canonical_time_zone("+2330"), Some("+2330".to_string()));
     // 非法分钟/小时拒绝。
     assert_eq!(canonical_time_zone("+2400"), None);
     assert_eq!(canonical_time_zone("+0060"), None);
@@ -182,8 +182,8 @@ fn offset_seconds_representation_sub_minute() {
     assert_eq!(parse_any_offset_seconds("+01:00:00"), Some(3600));
     assert_eq!(parse_any_offset_seconds("-23:59:59"), Some(-(23 * 3600 + 59 * 60 + 59)));
     // 固定偏移秒值与分钟值 ×60 一致（±HH:MM 六字符形）。
-    assert_eq!(canonical_time_zone("+01:00"), Some(("+01:00".to_string(), 3600)));
-    assert_eq!(canonical_time_zone("-05:30"), Some(("-05:30".to_string(), -19800)));
+    assert_eq!(canonical_time_zone("+01:00"), Some("+01:00".to_string()));
+    assert_eq!(canonical_time_zone("-05:30"), Some("-05:30".to_string()));
     // 亚分钟偏移经 local_to_epoch_ns 与 parse_instant_string 互逆对拍。
     assert_eq!(
         parse_instant_string("2024-01-01T00:00:00-00:44:30"),
@@ -384,4 +384,52 @@ fn plain_time_apply_duration_ignores_date_units() {
     assert_eq!(time_delta, 9_000_000_000_000); // 2h30m
                                                // 忽略 days：time_delta 不含 DAY_NS 分量。
     assert_eq!(time_delta % 86_400_000_000_000, 9_000_000_000_000);
+}
+
+#[test]
+fn canonical_time_zone_iana_acceptance() {
+    // IANA 区名（含 legacy 别名）解到规范名；非法区名拒绝。
+    assert_eq!(canonical_time_zone("America/New_York"), Some("America/New_York".to_string()));
+    assert_eq!(canonical_time_zone("Asia/Calcutta"), Some("Asia/Kolkata".to_string()));
+    assert_eq!(canonical_time_zone("Etc/Ignored"), Some("Etc/UTC".to_string()));
+    assert_eq!(canonical_time_zone("Not/AZone"), None);
+    // UTC / 数值偏移臂不变（只返回规范名，不再返回偏移）。
+    assert_eq!(canonical_time_zone("UTC"), Some("UTC".to_string()));
+    assert_eq!(canonical_time_zone("Z"), Some("UTC".to_string()));
+    assert_eq!(canonical_time_zone("+01:00"), Some("+01:00".to_string()));
+    // 注解串：IANA 区注解解到规范名。
+    assert_eq!(canonical_time_zone("2024-01-01T00:00:00[UTC]"), Some("UTC".to_string()));
+    assert_eq!(
+        canonical_time_zone("2024-01-01T00:00:00[America/New_York]"),
+        Some("America/New_York".to_string())
+    );
+}
+
+#[test]
+fn zone_offset_seconds_fixed_and_iana() {
+    // 固定区退化情形：偏移与 epoch 无关，恒返常量（含亚分钟偏移）。
+    assert_eq!(zone_offset_seconds("+05:30", 0), Some(19800));
+    assert_eq!(zone_offset_seconds("-00:44:30", 1_000_000_000), Some(-2670));
+    assert_eq!(zone_offset_seconds("UTC", 0), Some(0));
+    // IANA 区：1970 前后两点（EST / EDT 边界 2000-04-02T07:00Z，纽约本地 02:00）。
+    assert_eq!(zone_offset_seconds("America/New_York", 0), Some(-18000));
+    assert_eq!(zone_offset_seconds("America/New_York", 954_658_800), Some(-14400));
+    assert_eq!(zone_offset_seconds("America/New_York", 954_658_800 - 1), Some(-18000));
+    // 非法区名返回 None。
+    assert_eq!(zone_offset_seconds("Not/AZone", 0), None);
+}
+
+#[test]
+fn sub_minute_offset_getter_branch() {
+    // Monrovia -00:44:30：四格式化面补秒段；整分钟偏移不补。
+    assert_eq!(format_offset_seconds_text(-2670), "-00:44:30");
+    assert_eq!(format_offset_seconds_text(2670), "+00:44:30");
+    assert_eq!(format_offset_seconds_text(3600), "+01:00");
+    assert_eq!(format_time_zone_annotation("-00:44:30", false), "[-00:44:30]");
+    let iso = format_zoned_date_time_iso(0, -2670, "-00:44:30", "iso8601", true, None, "auto", "auto", "auto");
+    assert_eq!(iso, Some("1969-12-31T23:15:30-00:44:30[-00:44:30]".to_string()));
+    assert_eq!(
+        format_instant_iso(0, Some(-2670), true, None),
+        Some("1969-12-31T23:15:30-00:44:30".to_string())
+    );
 }

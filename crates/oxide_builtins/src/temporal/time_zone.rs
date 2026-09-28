@@ -13,6 +13,8 @@
 
 use std::sync::LazyLock;
 
+use super::common::fixed_offset_seconds;
+
 /// 单个时区的解析结果：transition 表加偏移查找所需的预存值。
 ///
 /// `transitions` 为 `(纪元秒, 该时刻起生效的偏移秒)`，按纪元秒严格升序；
@@ -1121,7 +1123,6 @@ static ZONE_TABLE: LazyLock<ZoneTable> = LazyLock::new(|| {
 ///
 /// # 注意事项
 /// - 首次调用触发全量解析（毫秒级），之后为纯二分。
-#[allow(dead_code)]
 pub(crate) fn tz_zone_data(name: &str) -> Option<&'static TzifZone> {
     let target = match LEGACY_ALIASES.binary_search_by(|a| a.0.cmp(name)) {
         Ok(i) => LEGACY_ALIASES[i].1,
@@ -1131,6 +1132,26 @@ pub(crate) fn tz_zone_data(name: &str) -> Option<&'static TzifZone> {
         Ok(i) => Some(&ZONE_TABLE.zones[i].1),
         Err(_) => None,
     }
+}
+
+/// 按 IANA 区名（含 legacy 别名）查规范区名。
+///
+/// # 步骤
+/// 1. 先解 legacy 别名（`LEGACY_ALIASES` 二分），未命中则原名。
+/// 2. 在区表二分查找，命中返回其规范名（`&'static str`）。
+///
+/// # 边界与前提
+/// - 别名只解一层：别名目标是现行区名，不再二次解别名。
+pub(crate) fn tz_canonical_name(name: &str) -> Option<&'static str> {
+    let target = match LEGACY_ALIASES.binary_search_by(|a| a.0.cmp(name)) {
+        Ok(i) => LEGACY_ALIASES[i].1,
+        Err(_) => name,
+    };
+    ZONE_TABLE
+        .zones
+        .binary_search_by(|z| z.0.cmp(target))
+        .ok()
+        .map(|i| ZONE_TABLE.zones[i].0)
 }
 
 /// 查某区在 `epoch_s`（纪元秒）生效的 UTC 偏移（秒）。
@@ -1147,7 +1168,6 @@ pub(crate) fn tz_zone_data(name: &str) -> Option<&'static TzifZone> {
 /// # 注意事项
 /// - 只支持正向查找（epoch → 偏移）；local → epoch 的逆换算（ambiguous /
 ///   nonexistent）由调用方迭代，不在本函数。
-#[allow(dead_code)]
 pub(crate) fn tz_offset_seconds(zone: &str, epoch_s: i64) -> Option<i64> {
     let z = tz_zone_data(zone)?;
     if z.transitions.is_empty() {
@@ -1161,6 +1181,23 @@ pub(crate) fn tz_offset_seconds(zone: &str, epoch_s: i64) -> Option<i64> {
     } else {
         Some(i64::from(z.transitions[idx - 1].1))
     }
+}
+
+/// 统一时区偏移查找（epoch 依赖）：固定偏移区（数值偏移串）走快速路径恒返常量，
+/// IANA 区走 transition 表二分。
+///
+/// # 步骤
+/// 1. 数值偏移串（±HH:MM / ±HH / ±HHMM / ±HH:MM:SS）直接解析为秒返回。
+/// 2. 未命中走 `tz_offset_seconds`（IANA 区，含 legacy 别名）。
+///
+/// # 边界与前提
+/// - 固定偏移区是 zone-aware 路径的退化情形：偏移与 epoch 无关，恒返回常量。
+/// - 非法区名（非数值偏移串且不在区表）返回 `None`。
+pub(crate) fn zone_offset_seconds(zone: &str, epoch_s: i64) -> Option<i64> {
+    if let Some(offset) = fixed_offset_seconds(zone) {
+        return Some(offset);
+    }
+    tz_offset_seconds(zone, epoch_s)
 }
 
 /// 判断 `name` 是否为可接受的 IANA 区名（含 legacy 别名）。

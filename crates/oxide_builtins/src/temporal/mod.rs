@@ -19,6 +19,8 @@ pub use plain_date_time::*;
 pub use plain_month_day::*;
 pub use plain_time::*;
 pub use plain_year_month::*;
+#[cfg(test)]
+use time_zone::*;
 pub use zoned_date_time::*;
 
 #[cfg(test)]

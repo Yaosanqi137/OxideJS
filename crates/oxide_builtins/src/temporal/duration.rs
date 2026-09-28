@@ -15,7 +15,8 @@ use super::difference::{
     add_date_duration, add_days_iso, compare_iso_date, date_duration_sign, date_until_iso, nudge_iso_difference,
     nudge_window, plain_date_time_unit_index, round_instant_difference, DifferenceSettings, DAY_NS, MAX_ISO_DAY,
 };
-use super::instant::{instant_rounding_mode, instant_time_zone_offset, InstantRoundingMode};
+use super::instant::{instant_rounding_mode, InstantRoundingMode};
+use super::time_zone::zone_offset_seconds;
 use super::zoned_date_time::{parse_any_offset_seconds, valid_offset_fraction, zoned_date_time_string_parts};
 use super::{make_duration, parse_plain_date_time_string};
 
@@ -306,11 +307,11 @@ fn duration_relative_to_date<H: VmHost>(
         if let Ok((year, month, day, _time_ns)) = parse_plain_date_time_string(&text) {
             return Ok(Some((i128::from(year), i128::from(month), i128::from(day))));
         }
-        // 回退支：plain 首支解析失败的串（含 Z 的串或非法注解）。命名区当前全部 RangeError
-        // （canonical_time_zone 拒 IANA），可解析的带注解串已被 plain 首支接受。
-        // 按 instant 解析 + 注解时区反推墙钟日期。
+        // 回退支：plain 首支解析失败的串（含 Z 的串、IANA 区注解串）。
+        // 按 instant 解析 + 注解时区偏移（epoch 依赖查找）反推墙历日期。
         let (epoch_ns, time_zone_id, _calendar) = zoned_date_time_string_parts(vm, &text, "reject")?;
-        let offset_seconds = instant_time_zone_offset(&time_zone_id).unwrap_or(0);
+        let offset_seconds = zone_offset_seconds(&time_zone_id, epoch_ns.div_euclid(1_000_000_000) as i64)
+            .ok_or_else(|| crate::error::create_range_error(vm, "invalid time zone"))?;
         let wall_ns = epoch_ns + i128::from(offset_seconds) * 1_000_000_000;
         let (year, month, day) = civil_from_days(wall_ns.div_euclid(DAY_NS));
         return Ok(Some((year, month, day)));

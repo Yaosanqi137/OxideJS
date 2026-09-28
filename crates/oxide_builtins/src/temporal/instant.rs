@@ -7,12 +7,14 @@ use oxide_types::object::JsObject;
 use oxide_types::value::JsValue;
 
 use super::common::native_try;
+use super::time_zone::zone_offset_seconds;
 use super::{
     balance_instant_difference, canonical_time_zone, civil_from_days, days_from_civil, days_in_month,
-    duration_like_values, duration_time_nanoseconds, ensure_instant, format_iso_year, get_instant_epoch_ns,
-    initialize_temporal_receiver, is_ctor_call, make_duration, make_instant, make_zoned_date_time, native_engine_error,
-    parse_digits, parse_fractional_second_digits, receiver_obj, round_instant_difference, temporal_option_number,
-    temporal_option_string, temporal_option_value, FractionalSecondDigitsInput, MAX_INSTANT_NS,
+    duration_like_values, duration_time_nanoseconds, ensure_instant, format_iso_year, format_offset_seconds_text,
+    get_instant_epoch_ns, initialize_temporal_receiver, is_ctor_call, make_duration, make_instant,
+    make_zoned_date_time, native_engine_error, parse_digits, parse_fractional_second_digits, receiver_obj,
+    round_instant_difference, temporal_option_number, temporal_option_string, temporal_option_value,
+    FractionalSecondDigitsInput, MAX_INSTANT_NS,
 };
 
 pub(crate) fn instant_string_without_annotations(input: &str) -> Option<&str> {
@@ -727,11 +729,7 @@ pub fn instant_since<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
     instant_difference(vm, args, true)
 }
 
-pub(crate) fn instant_time_zone_offset(value: &str) -> Option<i64> {
-    canonical_time_zone(value).map(|(_, offset)| offset)
-}
-
-fn format_instant_iso(
+pub(crate) fn format_instant_iso(
     epoch_ns: i128, offset_seconds: Option<i64>, include_seconds: bool, fractional_digits: Option<usize>,
 ) -> Option<String> {
     const DAY_NS: i128 = 86_400_000_000_000;
@@ -767,9 +765,7 @@ fn format_instant_iso(
     }
 
     if let Some(offset) = offset_seconds {
-        let sign = if offset < 0 { '-' } else { '+' };
-        let magnitude = offset.abs();
-        output.push_str(&format!("{sign}{:02}:{:02}", magnitude / 3600, (magnitude % 3600) / 60));
+        output.push_str(&format_offset_seconds_text(offset));
     } else {
         output.push('Z');
     }
@@ -857,7 +853,7 @@ pub fn instant_to_string<H: VmHost>(vm: &mut H, args: &[u8]) -> NativeResult {
             return NativeResult::Err(crate::error::create_type_error(vm, "invalid time zone"));
         }
         let time_zone = to_string(time_zone_raw);
-        match instant_time_zone_offset(&time_zone) {
+        match zone_offset_seconds(&time_zone, epoch_ns.div_euclid(1_000_000_000) as i64) {
             Some(offset) => Some(offset),
             None => return NativeResult::Err(crate::error::create_range_error(vm, "invalid time zone")),
         }
@@ -900,7 +896,7 @@ pub fn instant_to_zoned_date_time_iso<H: VmHost>(vm: &mut H, args: &[u8]) -> Nat
         return NativeResult::Err(crate::error::create_type_error(vm, "invalid time zone"));
     }
     let input = to_string(raw);
-    let Some((time_zone_id, _)) = canonical_time_zone(&input) else {
+    let Some(time_zone_id) = canonical_time_zone(&input) else {
         return NativeResult::Err(crate::error::create_range_error(vm, "invalid time zone"));
     };
     make_zoned_date_time(vm, epoch_ns, &time_zone_id, "iso8601")
