@@ -1242,8 +1242,8 @@ mod tests {
     }
 
     #[test]
-    fn casey_two_transitions_same_wall_day() {
-        // 2010-03-04 同一墙历日两次生效（表中为两条不同纪元 transition），解析器只保表。
+    fn casey_2010_revert_to_utc8() {
+        // 2010-03-05 02:00（+11:00 当地）一次性回到 +08:00，源表为一次性日期而非循环规则。
         assert_eq!(tz_offset_seconds("Antarctica/Casey", 1267714800 - 1), Some(39600));
         assert_eq!(tz_offset_seconds("Antarctica/Casey", 1267714800), Some(28800));
     }
